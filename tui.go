@@ -5,8 +5,10 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/charmbracelet/bubbles/textinput"
@@ -238,6 +240,25 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 									m.deleteTarget = m.localModels[row.repoIdx].Repo + "/" + m.localModels[row.repoIdx].Files[row.fileIdx].Name
 								} else {
 									m.deleteTarget = m.localModels[row.repoIdx].Repo
+								}
+							}
+							return m, nil
+						case "r":
+							row := m.currentLocalRow()
+							if row != nil && row.isFile {
+								mod := m.localModels[row.repoIdx]
+								f := mod.Files[row.fileIdx]
+								cfg := loadConfig()
+								modelPath := filepath.Join(expandHome(cfg.DownloadsDir), mod.Repo, f.Name)
+								runCmd := cfg.RunCommand
+								runCmd = strings.ReplaceAll(runCmd, "{model}", modelPath)
+								parts := strings.Fields(runCmd)
+								if len(parts) > 0 {
+									c := exec.Command(parts[0], parts[1:]...)
+									c.Stdout = os.Stderr
+									c.Stderr = os.Stderr
+									c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+									c.Start()
 								}
 							}
 							return m, nil
@@ -780,6 +801,7 @@ func (m tuiModel) viewHelp() string {
 		{"q", "Back / Quit"},
 		{"s", "Cycle sort (search or downloaded panel)"},
 		{"d", "Delete model (downloaded panel)"},
+		{"r", "Run model with llama-server (downloaded panel)"},
 		{"←/→", "Previous/Next page (in search)"},
 		{"Tab", "Switch focus: search ↔ downloaded / README ↔ Files"},
 		{"?", "Toggle this help"},
@@ -897,7 +919,7 @@ func (m tuiModel) viewInput() string {
 	if len(m.localModels) == 0 {
 		b.WriteString(dimStyle.Render("\nNo downloaded models"))
 	} else if m.localFocus {
-		b.WriteString(helpStyle.Render("Enter expand · d delete · s sort · Tab: focus search"))
+		b.WriteString(helpStyle.Render("Enter expand · r run · d delete · s sort · Tab: focus search"))
 	}
 
 	return b.String()

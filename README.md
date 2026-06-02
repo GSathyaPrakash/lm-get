@@ -67,7 +67,8 @@ Create defaults with `lm-get config init`:
   "downloads_dir": "~/Models",
   "results_per_page": 20,
   "default_sort": "downloads",
-  "cache_ttl_seconds": 300
+  "cache_ttl_seconds": 300,
+  "run_command": "llama-server --model {model} --port 8080"
 }
 ```
 
@@ -77,6 +78,7 @@ Create defaults with `lm-get config init`:
 | `results_per_page` | `20` | Search results per page |
 | `default_sort` | `downloads` | Sort field: `downloads`, `likes`, `lastModified` |
 | `cache_ttl_seconds` | `300` | API cache time-to-live in seconds |
+| `run_command` | `llama-server --model {model} --port 8080` | Command to run a model, `{model}` is replaced with file path |
 
 Cache is stored at `~/.cache/lm-get/`.
 
@@ -90,6 +92,7 @@ Cache is stored at `~/.cache/lm-get/`.
 | `q` | Back / Quit |
 | `s` | Cycle sort (search results or downloaded panel) |
 | `d` | Delete model (downloaded panel, with confirmation) |
+| `r` | Run model with llama-server (downloaded panel) |
 | `n`, `p` | Next / Previous page (search results) |
 | `Tab` | Switch focus between panels |
 | `?` | Toggle help overlay |

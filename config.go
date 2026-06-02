@@ -12,6 +12,7 @@ type Config struct {
 	ResultsPerPage int    `json:"results_per_page"`
 	DefaultSort    string `json:"default_sort"`
 	CacheTTL       int    `json:"cache_ttl_seconds"`
+	RunCommand     string `json:"run_command"`
 }
 
 func defaultConfig() Config {
@@ -20,6 +21,7 @@ func defaultConfig() Config {
 		ResultsPerPage: 20,
 		DefaultSort:    "downloads",
 		CacheTTL:       300,
+		RunCommand:     "llama-server --model {model} --port 8080",
 	}
 }
 
@@ -39,6 +41,9 @@ func (c Config) validate() Config {
 	}
 	if c.DownloadsDir == "" {
 		c.DownloadsDir = "~/Models"
+	}
+	if c.RunCommand == "" {
+		c.RunCommand = "llama-server --model {model} --port 8080"
 	}
 	return c
 }
