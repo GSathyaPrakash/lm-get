@@ -74,6 +74,7 @@ type tuiModel struct {
 	serverName    string
 	viewLogs      bool
 	logScroll     int
+	logCh         chan string
 }
 
 type localRow struct {
@@ -210,6 +211,9 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					for _, p := range m.runningProcs {
 						syscall.Kill(-p.Pid, syscall.SIGTERM)
 					}
+					for _, p := range m.runningProcs {
+						p.Wait()
+					}
 					m.runningProcs = nil
 					m.serverLogs = append(m.serverLogs, "", "[Server stopped]")
 					return m, nil
@@ -244,7 +248,8 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						row := m.currentLocalRow()
 						if row != nil {
 							if row.isFile {
-								m.runLocalFile(row)
+								cmd := m.runLocalFile(row)
+								return m, cmd
 							} else {
 								m.localModels[row.repoIdx].Expanded = !m.localModels[row.repoIdx].Expanded
 							}
@@ -279,12 +284,16 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						case "r":
 							row := m.currentLocalRow()
 							if row != nil && row.isFile {
-								m.runLocalFile(row)
+								cmd := m.runLocalFile(row)
+								return m, cmd
 							}
 							return m, nil
 						case "k":
 							for _, p := range m.runningProcs {
 								syscall.Kill(-p.Pid, syscall.SIGTERM)
+							}
+							for _, p := range m.runningProcs {
+								p.Wait()
 							}
 							m.runningProcs = nil
 							m.serverLogs = append(m.serverLogs, "", "[Server stopped]")
@@ -454,6 +463,14 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		return m, waitForProgress(msg.ch)
+
+	case serverLogMsg:
+		if msg.line != "" {
+			m.serverLogs = append(m.serverLogs, msg.line)
+		}
+		if m.logCh != nil {
+			return m, waitForServerLog(m.logCh)
+		}
 	}
 
 	return m, nil
@@ -677,9 +694,23 @@ func (m tuiModel) handleLocalDown() (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m *tuiModel) runLocalFile(row *localRow) {
+type serverLogMsg struct {
+	line string
+}
+
+func waitForServerLog(ch chan string) tea.Cmd {
+	return func() tea.Msg {
+		line, ok := <-ch
+		if !ok {
+			return nil
+		}
+		return serverLogMsg{line: line}
+	}
+}
+
+func (m *tuiModel) runLocalFile(row *localRow) tea.Cmd {
 	if row == nil || !row.isFile {
-		return
+		return nil
 	}
 	mod := m.localModels[row.repoIdx]
 	f := mod.Files[row.fileIdx]
@@ -689,7 +720,7 @@ func (m *tuiModel) runLocalFile(row *localRow) {
 	runCmd = strings.ReplaceAll(runCmd, "{model}", modelPath)
 	parts := strings.Fields(runCmd)
 	if len(parts) == 0 {
-		return
+		return nil
 	}
 	c := exec.Command(parts[0], parts[1:]...)
 	c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -699,7 +730,7 @@ func (m *tuiModel) runLocalFile(row *localRow) {
 	if err := c.Start(); err != nil {
 		logW.Close()
 		logR.Close()
-		return
+		return nil
 	}
 	logW.Close()
 	m.runningProcs = append(m.runningProcs, c.Process)
@@ -707,14 +738,18 @@ func (m *tuiModel) runLocalFile(row *localRow) {
 	m.serverLogs = []string{fmt.Sprintf("$ %s", runCmd), ""}
 	m.logScroll = 0
 	m.viewLogs = true
-	go func(r *os.File, logs *[]string) {
+
+	m.logCh = make(chan string, 256)
+	go func(r *os.File, ch chan string) {
 		buf := make([]byte, 4096)
 		for {
 			n, err := r.Read(buf)
 			if n > 0 {
 				chunk := string(buf[:n])
 				for _, l := range strings.Split(chunk, "\n") {
-					*logs = append(*logs, l)
+					if l != "" {
+						ch <- l
+					}
 				}
 			}
 			if err != nil {
@@ -722,7 +757,10 @@ func (m *tuiModel) runLocalFile(row *localRow) {
 			}
 		}
 		r.Close()
-	}(logR, &m.serverLogs)
+		close(ch)
+	}(logR, m.logCh)
+
+	return waitForServerLog(m.logCh)
 }
 
 func (m tuiModel) View() string {
