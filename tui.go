@@ -25,6 +25,7 @@ const (
 	viewDetail
 	viewDownloading
 	viewMmprojPrompt
+	viewServerLogs
 )
 
 var sortOptions = []string{"downloads", "likes", "lastModified"}
@@ -68,6 +69,11 @@ type tuiModel struct {
 	localFocus   bool
 	deleteConfirm bool
 	deleteTarget  string
+	runningProcs  []*os.Process
+	serverLogs    []string
+	serverName    string
+	viewLogs      bool
+	logScroll     int
 }
 
 type localRow struct {
@@ -195,6 +201,29 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		if m.state == viewInput {
+			if m.viewLogs {
+				switch msg.String() {
+				case "esc", "l":
+					m.viewLogs = false
+					return m, nil
+				case "k":
+					for _, p := range m.runningProcs {
+						syscall.Kill(-p.Pid, syscall.SIGTERM)
+					}
+					m.runningProcs = nil
+					m.serverLogs = append(m.serverLogs, "", "[Server stopped]")
+					return m, nil
+				case "up":
+					if m.logScroll > 0 {
+						m.logScroll--
+					}
+					return m, nil
+				case "down":
+					m.logScroll++
+					return m, nil
+				}
+				return m, nil
+			}
 			switch msg.String() {
 			case "ctrl+c":
 				return m, tea.Quit
@@ -222,9 +251,9 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					default:
 					if m.localFocus {
 						switch msg.String() {
-						case "up", "k":
+						case "up":
 							return m.handleLocalUp()
-						case "down", "j":
+						case "down":
 							return m.handleLocalDown()
 						case "s":
 							m.localSortBy = (m.localSortBy + 1) % 2
@@ -255,11 +284,48 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 								parts := strings.Fields(runCmd)
 								if len(parts) > 0 {
 									c := exec.Command(parts[0], parts[1:]...)
-									c.Stdout = os.Stderr
-									c.Stderr = os.Stderr
 									c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-									c.Start()
+									logR, logW, _ := os.Pipe()
+									c.Stdout = logW
+									c.Stderr = logW
+									if err := c.Start(); err == nil {
+										logW.Close()
+										m.runningProcs = append(m.runningProcs, c.Process)
+										m.serverName = f.Name
+										m.serverLogs = []string{fmt.Sprintf("$ %s", runCmd), ""}
+										m.logScroll = 0
+										m.viewLogs = true
+										go func(r *os.File, logs *[]string) {
+											buf := make([]byte, 4096)
+											for {
+												n, err := r.Read(buf)
+												if n > 0 {
+													chunk := string(buf[:n])
+													lines := strings.Split(chunk, "\n")
+													for _, l := range lines {
+														*logs = append(*logs, l)
+													}
+												}
+												if err != nil {
+													break
+												}
+											}
+											r.Close()
+										}(logR, &m.serverLogs)
+									}
 								}
+							}
+							return m, nil
+						case "k":
+							for _, p := range m.runningProcs {
+								syscall.Kill(-p.Pid, syscall.SIGTERM)
+							}
+							m.runningProcs = nil
+							m.serverLogs = append(m.serverLogs, "", "[Server stopped]")
+							return m, nil
+						case "l":
+							if len(m.serverLogs) > 0 {
+								m.viewLogs = true
 							}
 							return m, nil
 						}
@@ -651,6 +717,9 @@ func (m tuiModel) View() string {
 	}
 	switch m.state {
 	case viewInput:
+		if m.viewLogs {
+			return m.viewServerLogs()
+		}
 		return m.viewInput()
 	case viewLoading:
 		return m.viewLoading()
@@ -802,6 +871,8 @@ func (m tuiModel) viewHelp() string {
 		{"s", "Cycle sort (search or downloaded panel)"},
 		{"d", "Delete model (downloaded panel)"},
 		{"r", "Run model with llama-server (downloaded panel)"},
+		{"k", "Kill running server"},
+		{"l", "View server logs"},
 		{"←/→", "Previous/Next page (in search)"},
 		{"Tab", "Switch focus: search ↔ downloaded / README ↔ Files"},
 		{"?", "Toggle this help"},
@@ -919,7 +990,7 @@ func (m tuiModel) viewInput() string {
 	if len(m.localModels) == 0 {
 		b.WriteString(dimStyle.Render("\nNo downloaded models"))
 	} else if m.localFocus {
-		b.WriteString(helpStyle.Render("Enter expand · r run · d delete · s sort · Tab: focus search"))
+		b.WriteString(helpStyle.Render("Enter expand · r run · l logs · k kill · d delete · s sort · Tab: focus search"))
 	}
 
 	return b.String()
@@ -1176,6 +1247,53 @@ func (m tuiModel) viewMmprojPrompt() string {
 	b.WriteString(helpStyle.Render("Download mmproj? "))
 	b.WriteString(greenStyle.Render("[y] Yes") + "  " + redStyle.Render("[n] No"))
 	b.WriteString("\n")
+	return b.String()
+}
+
+func (m tuiModel) viewServerLogs() string {
+	var b strings.Builder
+	running := ""
+	if len(m.runningProcs) > 0 {
+		running = greenStyle.Render(fmt.Sprintf(" (running, pid %d)", m.runningProcs[0].Pid))
+	}
+	b.WriteString(headerStyle.Render(fmt.Sprintf("Server: %s", m.serverName)))
+	b.WriteString(running)
+	b.WriteString("\n\n")
+
+	logH := m.windowH - 4
+	if logH < 5 {
+		logH = 10
+	}
+
+	totalLines := len(m.serverLogs)
+	start := m.logScroll
+	if start > totalLines-logH {
+		start = totalLines - logH
+	}
+	if start < 0 {
+		start = 0
+	}
+	end := start + logH
+	if end > totalLines {
+		end = totalLines
+	}
+
+	for _, l := range m.serverLogs[start:end] {
+		if strings.Contains(l, "error") || strings.Contains(l, "Error") || strings.Contains(l, "ERROR") {
+			b.WriteString(redStyle.Render(l))
+		} else if strings.HasPrefix(l, "$") {
+			b.WriteString(dimStyle.Render(l))
+		} else if strings.HasPrefix(l, "[") {
+			b.WriteString(yellowStyle.Render(l))
+		} else if strings.Contains(l, "listening") || strings.Contains(l, "Listening") {
+			b.WriteString(greenStyle.Render(l))
+		} else {
+			b.WriteString(l)
+		}
+		b.WriteString("\n")
+	}
+
+	b.WriteString(helpStyle.Render("k kill server · l/Esc back · ↑/↓ scroll"))
 	return b.String()
 }
 

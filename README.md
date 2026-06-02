@@ -93,6 +93,8 @@ Cache is stored at `~/.cache/lm-get/`.
 | `s` | Cycle sort (search results or downloaded panel) |
 | `d` | Delete model (downloaded panel, with confirmation) |
 | `r` | Run model with llama-server (downloaded panel) |
+| `k` | Kill running server |
+| `l` | View server logs |
 | `n`, `p` | Next / Previous page (search results) |
 | `Tab` | Switch focus between panels |
 | `?` | Toggle help overlay |
