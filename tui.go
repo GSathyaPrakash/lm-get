@@ -68,6 +68,33 @@ type tuiModel struct {
 	deleteTarget  string
 }
 
+type localRow struct {
+	repoIdx int
+	fileIdx int
+	isFile  bool
+}
+
+func (m *tuiModel) localRows() []localRow {
+	var rows []localRow
+	for ri, mod := range m.localModels {
+		rows = append(rows, localRow{repoIdx: ri})
+		if mod.Expanded {
+			for fi := range mod.Files {
+				rows = append(rows, localRow{repoIdx: ri, fileIdx: fi, isFile: true})
+			}
+		}
+	}
+	return rows
+}
+
+func (m *tuiModel) currentLocalRow() *localRow {
+	rows := m.localRows()
+	if m.localCursor >= 0 && m.localCursor < len(rows) {
+		return &rows[m.localCursor]
+	}
+	return nil
+}
+
 type searchResultMsg struct {
 	models []HFModel
 	err    error
@@ -148,19 +175,14 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "y", "Y":
 				if m.deleteTarget != "" {
 					cfg := loadConfig()
-					repoPath := filepath.Join(expandHome(cfg.DownloadsDir), m.deleteTarget)
-					os.RemoveAll(repoPath)
+					targetPath := filepath.Join(expandHome(cfg.DownloadsDir), m.deleteTarget)
+					os.RemoveAll(targetPath)
 				}
 				m.deleteConfirm = false
 				m.deleteTarget = ""
-				m.localModels = scanLocalModels()
-				sortLocalModels(m.localModels, m.localSortBy)
-				if m.localCursor >= len(m.localModels) {
-					m.localCursor = len(m.localModels) - 1
-				}
-				if m.localCursor < 0 {
-					m.localCursor = 0
-				}
+				m.refreshLocal()
+				m.localCursor = 0
+				m.localScroll = 0
 				return m, nil
 			case "n", "N", "esc":
 				m.deleteConfirm = false
@@ -187,32 +209,41 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				return m, nil
 			case "enter":
-				if m.localFocus {
-					return m, nil
-				}
-				return m.handleEnter()
-			default:
-				if m.localFocus {
-					switch msg.String() {
-					case "up", "k":
-						return m.handleLocalUp()
-					case "down", "j":
-						return m.handleLocalDown()
-					case "s":
-						m.localSortBy = (m.localSortBy + 1) % 2
-						sortLocalModels(m.localModels, m.localSortBy)
-						m.localCursor = 0
-						m.localScroll = 0
-						return m, nil
-					case "d":
-						if m.localCursor >= 0 && m.localCursor < len(m.localModels) {
-							m.deleteConfirm = true
-							m.deleteTarget = m.localModels[m.localCursor].Repo
+					if m.localFocus {
+						row := m.currentLocalRow()
+						if row != nil && !row.isFile {
+							m.localModels[row.repoIdx].Expanded = !m.localModels[row.repoIdx].Expanded
 						}
 						return m, nil
 					}
-					return m, nil
-				}
+					return m.handleEnter()
+					default:
+					if m.localFocus {
+						switch msg.String() {
+						case "up", "k":
+							return m.handleLocalUp()
+						case "down", "j":
+							return m.handleLocalDown()
+						case "s":
+							m.localSortBy = (m.localSortBy + 1) % 2
+							sortLocalModels(m.localModels, m.localSortBy)
+							m.localCursor = 0
+							m.localScroll = 0
+							return m, nil
+						case "d":
+							row := m.currentLocalRow()
+							if row != nil {
+								m.deleteConfirm = true
+								if row.isFile {
+									m.deleteTarget = m.localModels[row.repoIdx].Repo + "/" + m.localModels[row.repoIdx].Files[row.fileIdx].Name
+								} else {
+									m.deleteTarget = m.localModels[row.repoIdx].Repo
+								}
+							}
+							return m, nil
+						}
+						return m, nil
+					}
 				var cmd tea.Cmd
 				m.input, cmd = m.input.Update(msg)
 				return m, cmd
@@ -269,16 +300,16 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				cfg := loadConfig()
 				return m, doSearch(m.query, cfg.ResultsPerPage, sortOptions[m.sortIdx], "-1", m.page)
 			}
-		case "n":
-			if m.state == viewSearch {
-				m.page++
+		case "left":
+			if m.state == viewSearch && m.page > 1 {
+				m.page--
 				m.state = viewLoading
 				cfg := loadConfig()
 				return m, doSearch(m.query, cfg.ResultsPerPage, sortOptions[m.sortIdx], "-1", m.page)
 			}
-		case "p":
-			if m.state == viewSearch && m.page > 1 {
-				m.page--
+		case "right":
+			if m.state == viewSearch {
+				m.page++
 				m.state = viewLoading
 				cfg := loadConfig()
 				return m, doSearch(m.query, cfg.ResultsPerPage, sortOptions[m.sortIdx], "-1", m.page)
@@ -567,17 +598,20 @@ func (m tuiModel) handleScrollDown() (tea.Model, tea.Cmd) {
 }
 
 func (m tuiModel) handleLocalUp() (tea.Model, tea.Cmd) {
+	rows := m.localRows()
 	if m.localCursor > 0 {
 		m.localCursor--
 		if m.localCursor < m.localScroll {
 			m.localScroll = m.localCursor
 		}
 	}
+	_ = rows
 	return m, nil
 }
 
 func (m tuiModel) handleLocalDown() (tea.Model, tea.Cmd) {
-	if m.localCursor < len(m.localModels)-1 {
+	rows := m.localRows()
+	if m.localCursor < len(rows)-1 {
 		m.localCursor++
 		vis := m.windowH - 7
 		if vis < 3 {
@@ -746,7 +780,7 @@ func (m tuiModel) viewHelp() string {
 		{"q", "Back / Quit"},
 		{"s", "Cycle sort (search or downloaded panel)"},
 		{"d", "Delete model (downloaded panel)"},
-		{"n, p", "Next/Previous page (in search)"},
+		{"←/→", "Previous/Next page (in search)"},
 		{"Tab", "Switch focus: search ↔ downloaded / README ↔ Files"},
 		{"?", "Toggle this help"},
 		{"Ctrl+C", "Force quit"},
@@ -800,22 +834,31 @@ func (m tuiModel) viewInput() string {
 		b.WriteString(dimStyle.Render(fmt.Sprintf(" (%d models, sort: %s)", len(m.localModels), localSortLabel)))
 		b.WriteString("\n")
 
+		rows := m.localRows()
+
 		panelH := m.windowH - 7
 		if panelH < 3 {
 			panelH = 5
 		}
+		if m.localScroll >= len(rows) {
+			m.localScroll = len(rows) - 1
+		}
+		if m.localScroll < 0 {
+			m.localScroll = 0
+		}
 		end := m.localScroll + panelH
-		if end > len(m.localModels) {
-			end = len(m.localModels)
+		if end > len(rows) {
+			end = len(rows)
 		}
 
-		nameW := m.windowW - 48
+		nameW := m.windowW - 46
 		if nameW < 15 {
 			nameW = 15
 		}
 
 		for i := m.localScroll; i < end; i++ {
-			mod := m.localModels[i]
+			r := rows[i]
+			mod := m.localModels[r.repoIdx]
 			cursor := "  "
 			style := lipgloss.NewStyle()
 			if i == m.localCursor && m.localFocus {
@@ -823,13 +866,25 @@ func (m tuiModel) viewInput() string {
 				style = selStyle
 			}
 
-			relTime := relativeTime(mod.ModTime)
-			name := truncate(mod.Repo, nameW)
-			line := fmt.Sprintf("%-*s  %-9s  %2d files  %-12s",
-				nameW, name, formatSize(mod.Size), mod.FileCount, relTime)
-
-			b.WriteString(cursor)
-			b.WriteString(style.Render(line))
+			if r.isFile {
+				f := mod.Files[r.fileIdx]
+				relTime := relativeTime(f.ModTime)
+				fname := truncate(f.Name, nameW-2)
+				line := fmt.Sprintf("  %-*s  %-9s  %-12s", nameW-2, fname, formatSize(f.Size), relTime)
+				b.WriteString(cursor)
+				b.WriteString(style.Render(line))
+			} else {
+				relTime := relativeTime(mod.ModTime)
+				expandIcon := "▸"
+				if mod.Expanded {
+					expandIcon = "▾"
+				}
+				name := truncate(mod.Repo, nameW-3)
+				line := fmt.Sprintf("%s %-*s  %-9s  %2d files  %-12s",
+					expandIcon, nameW-3, name, formatSize(mod.Size), len(mod.Files), relTime)
+				b.WriteString(cursor)
+				b.WriteString(style.Render(line))
+			}
 			b.WriteString("\n")
 		}
 	}
@@ -837,6 +892,12 @@ func (m tuiModel) viewInput() string {
 	if m.deleteConfirm {
 		b.WriteString("\n")
 		b.WriteString(yellowStyle.Render(fmt.Sprintf("Delete %s? [y/N]", m.deleteTarget)))
+	}
+
+	if len(m.localModels) == 0 {
+		b.WriteString(dimStyle.Render("\nNo downloaded models"))
+	} else if m.localFocus {
+		b.WriteString(helpStyle.Render("Enter expand · d delete · s sort · Tab: focus search"))
 	}
 
 	return b.String()
@@ -900,7 +961,7 @@ func (m tuiModel) viewSearch() string {
 	}
 
 	b.WriteString("\n")
-	nav := "↑/↓ navigate · Enter select · s sort · n/p page"
+	nav := "↑/↓ navigate · Enter select · s sort · ←/→ page"
 	if m.page > 1 {
 		nav += " (p prev)"
 	}

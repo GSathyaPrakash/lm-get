@@ -9,13 +9,20 @@ import (
 	"time"
 )
 
+type localFile struct {
+	Name    string
+	Size    int64
+	ModTime time.Time
+}
+
 type localModel struct {
-	Repo       string
-	User       string
-	Name       string
-	Size       int64
-	ModTime    time.Time
-	FileCount  int
+	Repo      string
+	User      string
+	Name      string
+	Size      int64
+	ModTime   time.Time
+	Files     []localFile
+	Expanded  bool
 }
 
 type localSort int
@@ -51,26 +58,39 @@ func scanLocalModels() []localModel {
 				continue
 			}
 			repoPath := filepath.Join(userPath, repoDir.Name())
-			info, err := repoDir.Info()
+			dirInfo, err := repoDir.Info()
 			if err != nil {
 				continue
 			}
-			size := dirSize(repoPath)
-			fileCount := 0
-			if files, err := os.ReadDir(repoPath); err == nil {
-				for _, f := range files {
-					if !f.IsDir() && strings.HasSuffix(strings.ToLower(f.Name()), ".gguf") {
-						fileCount++
+			var files []localFile
+			var totalSize int64
+			if entries, err := os.ReadDir(repoPath); err == nil {
+				for _, f := range entries {
+					if f.IsDir() || !strings.HasSuffix(strings.ToLower(f.Name()), ".gguf") {
+						continue
 					}
+					fi, err := f.Info()
+					if err != nil {
+						continue
+					}
+					files = append(files, localFile{
+						Name:    f.Name(),
+						Size:    fi.Size(),
+						ModTime: fi.ModTime(),
+					})
+					totalSize += fi.Size()
 				}
 			}
+			if len(files) == 0 {
+				continue
+			}
 			models = append(models, localModel{
-				Repo:      userDir.Name() + "/" + repoDir.Name(),
-				User:      userDir.Name(),
-				Name:      repoDir.Name(),
-				Size:      size,
-				ModTime:   info.ModTime(),
-				FileCount: fileCount,
+				Repo:    userDir.Name() + "/" + repoDir.Name(),
+				User:    userDir.Name(),
+				Name:    repoDir.Name(),
+				Size:    totalSize,
+				ModTime: dirInfo.ModTime(),
+				Files:   files,
 			})
 		}
 	}
