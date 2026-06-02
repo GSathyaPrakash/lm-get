@@ -717,12 +717,8 @@ func (m *tuiModel) runLocalFile(row *localRow) tea.Cmd {
 	cfg := loadConfig()
 	modelPath := filepath.Join(expandHome(cfg.DownloadsDir), mod.Repo, f.Name)
 	runCmd := cfg.RunCommand
-	runCmd = strings.ReplaceAll(runCmd, "{model}", modelPath)
-	parts := strings.Fields(runCmd)
-	if len(parts) == 0 {
-		return nil
-	}
-	c := exec.Command(parts[0], parts[1:]...)
+	runCmd = strings.ReplaceAll(runCmd, "{model}", "'"+modelPath+"'")
+	c := exec.Command("/bin/sh", "-c", runCmd)
 	c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	logR, logW, _ := os.Pipe()
 	c.Stdout = logW
