@@ -242,8 +242,12 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "enter":
 					if m.localFocus {
 						row := m.currentLocalRow()
-						if row != nil && !row.isFile {
-							m.localModels[row.repoIdx].Expanded = !m.localModels[row.repoIdx].Expanded
+						if row != nil {
+							if row.isFile {
+								m.runLocalFile(row)
+							} else {
+								m.localModels[row.repoIdx].Expanded = !m.localModels[row.repoIdx].Expanded
+							}
 						}
 						return m, nil
 					}
@@ -275,45 +279,7 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						case "r":
 							row := m.currentLocalRow()
 							if row != nil && row.isFile {
-								mod := m.localModels[row.repoIdx]
-								f := mod.Files[row.fileIdx]
-								cfg := loadConfig()
-								modelPath := filepath.Join(expandHome(cfg.DownloadsDir), mod.Repo, f.Name)
-								runCmd := cfg.RunCommand
-								runCmd = strings.ReplaceAll(runCmd, "{model}", modelPath)
-								parts := strings.Fields(runCmd)
-								if len(parts) > 0 {
-									c := exec.Command(parts[0], parts[1:]...)
-									c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-									logR, logW, _ := os.Pipe()
-									c.Stdout = logW
-									c.Stderr = logW
-									if err := c.Start(); err == nil {
-										logW.Close()
-										m.runningProcs = append(m.runningProcs, c.Process)
-										m.serverName = f.Name
-										m.serverLogs = []string{fmt.Sprintf("$ %s", runCmd), ""}
-										m.logScroll = 0
-										m.viewLogs = true
-										go func(r *os.File, logs *[]string) {
-											buf := make([]byte, 4096)
-											for {
-												n, err := r.Read(buf)
-												if n > 0 {
-													chunk := string(buf[:n])
-													lines := strings.Split(chunk, "\n")
-													for _, l := range lines {
-														*logs = append(*logs, l)
-													}
-												}
-												if err != nil {
-													break
-												}
-											}
-											r.Close()
-										}(logR, &m.serverLogs)
-									}
-								}
+								m.runLocalFile(row)
 							}
 							return m, nil
 						case "k":
@@ -711,6 +677,54 @@ func (m tuiModel) handleLocalDown() (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m *tuiModel) runLocalFile(row *localRow) {
+	if row == nil || !row.isFile {
+		return
+	}
+	mod := m.localModels[row.repoIdx]
+	f := mod.Files[row.fileIdx]
+	cfg := loadConfig()
+	modelPath := filepath.Join(expandHome(cfg.DownloadsDir), mod.Repo, f.Name)
+	runCmd := cfg.RunCommand
+	runCmd = strings.ReplaceAll(runCmd, "{model}", modelPath)
+	parts := strings.Fields(runCmd)
+	if len(parts) == 0 {
+		return
+	}
+	c := exec.Command(parts[0], parts[1:]...)
+	c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	logR, logW, _ := os.Pipe()
+	c.Stdout = logW
+	c.Stderr = logW
+	if err := c.Start(); err != nil {
+		logW.Close()
+		logR.Close()
+		return
+	}
+	logW.Close()
+	m.runningProcs = append(m.runningProcs, c.Process)
+	m.serverName = f.Name
+	m.serverLogs = []string{fmt.Sprintf("$ %s", runCmd), ""}
+	m.logScroll = 0
+	m.viewLogs = true
+	go func(r *os.File, logs *[]string) {
+		buf := make([]byte, 4096)
+		for {
+			n, err := r.Read(buf)
+			if n > 0 {
+				chunk := string(buf[:n])
+				for _, l := range strings.Split(chunk, "\n") {
+					*logs = append(*logs, l)
+				}
+			}
+			if err != nil {
+				break
+			}
+		}
+		r.Close()
+	}(logR, &m.serverLogs)
+}
+
 func (m tuiModel) View() string {
 	if m.showHelp {
 		return m.viewHelp()
@@ -990,7 +1004,7 @@ func (m tuiModel) viewInput() string {
 	if len(m.localModels) == 0 {
 		b.WriteString(dimStyle.Render("\nNo downloaded models"))
 	} else if m.localFocus {
-		b.WriteString(helpStyle.Render("Enter expand · r run · l logs · k kill · d delete · s sort · Tab: focus search"))
+		b.WriteString(helpStyle.Render("Enter expand/run · r run · l logs · k kill · d delete · s sort · Tab: focus search"))
 	}
 
 	return b.String()
