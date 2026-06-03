@@ -1,9 +1,7 @@
-package main
+package tui
 
 import (
 	"fmt"
-	"io"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,6 +12,13 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+
+	"github.com/loq/lm-get/internal/api"
+	"github.com/loq/lm-get/internal/cli"
+	"github.com/loq/lm-get/internal/config"
+	"github.com/loq/lm-get/internal/display"
+	"github.com/loq/lm-get/internal/download"
+	"github.com/loq/lm-get/internal/models"
 )
 
 type view int
@@ -31,42 +36,42 @@ const (
 var sortOptions = []string{"downloads", "likes", "lastModified"}
 
 type tuiModel struct {
-	state        view
-	input        textinput.Model
-	models       []HFModel
-	entries      []DetailEntry
-	rawFiles     []HFFileTree
-	selected     int
-	fileCursor   int
-	scrollOff    int
-	readmeScroll int
-	query        string
-	repo         string
-	err          string
-	windowW      int
-	windowH      int
-	totalRAM     int64
-	downloading  bool
-	dlCurrent    int64
-	dlTotal      int64
-	dlDone       bool
-	dlOK         bool
-	dlFileName   string
-	dlDestPath   string
-	sortIdx      int
-	page         int
-	showHelp     bool
-	readme       string
-	detailFocus  int
-	mmprojEntry  *DetailEntry
-	dlQueue      []string
-	dlQueueIdx   int
-	nameScroll   int
-	localModels  []localModel
-	localCursor  int
-	localScroll  int
-	localSortBy  localSort
-	localFocus   bool
+	state         view
+	input         textinput.Model
+	models        []models.HFModel
+	entries       []models.DetailEntry
+	rawFiles      []models.HFFileTree
+	selected      int
+	fileCursor    int
+	scrollOff     int
+	readmeScroll  int
+	query         string
+	repo          string
+	err           string
+	windowW       int
+	windowH       int
+	totalRAM      int64
+	downloading   bool
+	dlCurrent     int64
+	dlTotal       int64
+	dlDone        bool
+	dlOK          bool
+	dlFileName    string
+	dlDestPath    string
+	sortIdx       int
+	page          int
+	showHelp      bool
+	readme        string
+	detailFocus   int
+	mmprojEntry   *models.DetailEntry
+	dlQueue       []string
+	dlQueueIdx    int
+	nameScroll    int
+	localModels   []models.LocalModel
+	localCursor   int
+	localScroll   int
+	localSortBy   models.LocalSort
+	localFocus    bool
 	deleteConfirm bool
 	deleteTarget  string
 	runningProcs  []*os.Process
@@ -75,6 +80,8 @@ type tuiModel struct {
 	viewLogs      bool
 	logScroll     int
 	logCh         chan string
+	logAutoScroll bool
+	modelLastMod  string
 }
 
 type localRow struct {
@@ -105,12 +112,12 @@ func (m *tuiModel) currentLocalRow() *localRow {
 }
 
 type searchResultMsg struct {
-	models []HFModel
+	models []models.HFModel
 	err    error
 }
 
 type filesResultMsg struct {
-	files  []HFFileTree
+	files  []models.HFFileTree
 	readme string
 	err    error
 }
@@ -123,6 +130,10 @@ type dlProgressMsg struct {
 	ch      chan dlProgressMsg
 }
 
+type serverLogMsg struct {
+	line string
+}
+
 func newTUIModel() tuiModel {
 	ti := textinput.New()
 	ti.Placeholder = "Search models (e.g. qwen, llama, mistral)..."
@@ -130,7 +141,7 @@ func newTUIModel() tuiModel {
 	ti.CharLimit = 100
 	ti.Width = 50
 
-	cfg := loadConfig()
+	cfg := config.Load()
 	sortIdx := 0
 	for i, s := range sortOptions {
 		if s == cfg.DefaultSort {
@@ -139,19 +150,20 @@ func newTUIModel() tuiModel {
 		}
 	}
 
-	models := scanLocalModels()
-	sortLocalModels(models, 0)
+	localModels := cli.ScanLocalModels()
+	cli.SortLocalModels(localModels, models.LocalSortTime)
 
 	return tuiModel{
 		state:       viewInput,
 		input:       ti,
-		totalRAM:    getSystemRAM(),
+		totalRAM:    display.GetSystemRAM(),
 		sortIdx:     sortIdx,
 		windowW:     80,
 		windowH:     24,
 		page:        1,
-		localModels: models,
-		localSortBy: localSortTime,
+		localModels:   localModels,
+		localSortBy:   models.LocalSortTime,
+		logAutoScroll: true,
 	}
 }
 
@@ -183,8 +195,8 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			switch msg.String() {
 			case "y", "Y":
 				if m.deleteTarget != "" {
-					cfg := loadConfig()
-					targetPath := filepath.Join(expandHome(cfg.DownloadsDir), m.deleteTarget)
+					cfg := config.Load()
+					targetPath := filepath.Join(display.ExpandHome(cfg.DownloadsDir), m.deleteTarget)
 					os.RemoveAll(targetPath)
 				}
 				m.deleteConfirm = false
@@ -220,10 +232,18 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				case "up":
 					if m.logScroll > 0 {
 						m.logScroll--
+						m.logAutoScroll = false
 					}
 					return m, nil
 				case "down":
 					m.logScroll++
+					logH := m.windowH - 4
+					if logH < 5 {
+						logH = 10
+					}
+					if m.logScroll >= len(m.serverLogs)-logH {
+						m.logAutoScroll = true
+					}
 					return m, nil
 				}
 				return m, nil
@@ -244,68 +264,77 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				return m, nil
 			case "enter":
-					if m.localFocus {
+				if m.localFocus {
+					row := m.currentLocalRow()
+					if row != nil {
+						if row.isFile {
+							cmd := m.runLocalFile(row)
+							return m, cmd
+						} else {
+							m.localModels[row.repoIdx].Expanded = !m.localModels[row.repoIdx].Expanded
+						}
+					}
+					return m, nil
+				}
+				return m.handleEnter()
+			case "down":
+				if !m.localFocus && len(m.localModels) > 0 {
+					m.localFocus = true
+					m.input.Blur()
+					return m, nil
+				}
+				if m.localFocus {
+					return m.handleLocalDown()
+				}
+			default:
+				if m.localFocus {
+					switch msg.String() {
+					case "up":
+						return m.handleLocalUp()
+					case "down":
+						return m.handleLocalDown()
+					case "s":
+						m.localSortBy = (m.localSortBy + 1) % 2
+						cli.SortLocalModels(m.localModels, m.localSortBy)
+						m.localCursor = 0
+						m.localScroll = 0
+						return m, nil
+					case "d":
 						row := m.currentLocalRow()
 						if row != nil {
+							m.deleteConfirm = true
 							if row.isFile {
-								cmd := m.runLocalFile(row)
-								return m, cmd
+								m.deleteTarget = m.localModels[row.repoIdx].Repo + "/" + m.localModels[row.repoIdx].Files[row.fileIdx].Name
 							} else {
-								m.localModels[row.repoIdx].Expanded = !m.localModels[row.repoIdx].Expanded
+								m.deleteTarget = m.localModels[row.repoIdx].Repo
 							}
 						}
 						return m, nil
-					}
-					return m.handleEnter()
-					default:
-					if m.localFocus {
-						switch msg.String() {
-						case "up":
-							return m.handleLocalUp()
-						case "down":
-							return m.handleLocalDown()
-						case "s":
-							m.localSortBy = (m.localSortBy + 1) % 2
-							sortLocalModels(m.localModels, m.localSortBy)
-							m.localCursor = 0
-							m.localScroll = 0
-							return m, nil
-						case "d":
-							row := m.currentLocalRow()
-							if row != nil {
-								m.deleteConfirm = true
-								if row.isFile {
-									m.deleteTarget = m.localModels[row.repoIdx].Repo + "/" + m.localModels[row.repoIdx].Files[row.fileIdx].Name
-								} else {
-									m.deleteTarget = m.localModels[row.repoIdx].Repo
-								}
-							}
-							return m, nil
-						case "r":
-							row := m.currentLocalRow()
-							if row != nil && row.isFile {
-								cmd := m.runLocalFile(row)
-								return m, cmd
-							}
-							return m, nil
-						case "k":
-							for _, p := range m.runningProcs {
-								syscall.Kill(-p.Pid, syscall.SIGTERM)
-							}
-							for _, p := range m.runningProcs {
-								p.Wait()
-							}
-							m.runningProcs = nil
-							m.serverLogs = append(m.serverLogs, "", "[Server stopped]")
-							return m, nil
-						case "l":
-							if len(m.serverLogs) > 0 {
-								m.viewLogs = true
-							}
-							return m, nil
+					case "r":
+						row := m.currentLocalRow()
+						if row != nil && row.isFile {
+							cmd := m.runLocalFile(row)
+							return m, cmd
+						}
+						return m, nil
+					case "k":
+						for _, p := range m.runningProcs {
+							syscall.Kill(-p.Pid, syscall.SIGTERM)
+						}
+						for _, p := range m.runningProcs {
+							p.Wait()
+						}
+						m.runningProcs = nil
+						m.serverLogs = append(m.serverLogs, "", "[Server stopped]")
+						return m, nil
+					case "l":
+						if len(m.serverLogs) > 0 {
+							m.viewLogs = true
 						}
 						return m, nil
 					}
+					return m, nil
+				}
 				var cmd tea.Cmd
 				m.input, cmd = m.input.Update(msg)
 				return m, cmd
@@ -316,8 +345,8 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			switch msg.String() {
 			case "y", "Y":
 				if m.mmprojEntry != nil {
-					cfg := loadConfig()
-					destDir := filepath.Join(expandHome(cfg.DownloadsDir), m.repo)
+					cfg := config.Load()
+					destDir := filepath.Join(display.ExpandHome(cfg.DownloadsDir), m.repo)
 					paths := m.mmprojEntry.Paths
 					m.dlQueue = paths
 					m.dlQueueIdx = 0
@@ -329,7 +358,7 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.dlOK = false
 					m.downloading = true
 					m.state = viewDownloading
-					url := getDownloadURL(m.repo, paths[0])
+					url := api.GetDownloadURL(m.repo, paths[0])
 					return m, doDownload(url, m.dlDestPath, m.mmprojEntry.TotalSize, nil)
 				}
 				m.state = viewDetail
@@ -359,21 +388,21 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.sortIdx = (m.sortIdx + 1) % len(sortOptions)
 				m.page = 1
 				m.state = viewLoading
-				cfg := loadConfig()
+				cfg := config.Load()
 				return m, doSearch(m.query, cfg.ResultsPerPage, sortOptions[m.sortIdx], "-1", m.page)
 			}
 		case "left":
 			if m.state == viewSearch && m.page > 1 {
 				m.page--
 				m.state = viewLoading
-				cfg := loadConfig()
+				cfg := config.Load()
 				return m, doSearch(m.query, cfg.ResultsPerPage, sortOptions[m.sortIdx], "-1", m.page)
 			}
 		case "right":
 			if m.state == viewSearch {
 				m.page++
 				m.state = viewLoading
-				cfg := loadConfig()
+				cfg := config.Load()
 				return m, doSearch(m.query, cfg.ResultsPerPage, sortOptions[m.sortIdx], "-1", m.page)
 			}
 		case "tab":
@@ -443,8 +472,8 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.rawFiles = msg.files
-		mf := parseModelFiles(msg.files)
-		m.entries = buildDetailEntries(mf, m.repo)
+		mf := api.ParseModelFiles(msg.files)
+		m.entries = api.BuildDetailEntries(mf, m.repo)
 		m.readme = msg.readme
 		m.fileCursor = 0
 		m.scrollOff = 0
@@ -467,6 +496,16 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case serverLogMsg:
 		if msg.line != "" {
 			m.serverLogs = append(m.serverLogs, msg.line)
+			if m.logAutoScroll {
+				logH := m.windowH - 4
+				if logH < 5 {
+					logH = 10
+				}
+				m.logScroll = len(m.serverLogs) - logH
+				if m.logScroll < 0 {
+					m.logScroll = 0
+				}
+			}
 		}
 		if m.logCh != nil {
 			return m, waitForServerLog(m.logCh)
@@ -477,8 +516,8 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m *tuiModel) refreshLocal() {
-	m.localModels = scanLocalModels()
-	sortLocalModels(m.localModels, m.localSortBy)
+	m.localModels = cli.ScanLocalModels()
+	cli.SortLocalModels(m.localModels, m.localSortBy)
 	if m.localCursor >= len(m.localModels) {
 		m.localCursor = len(m.localModels) - 1
 	}
@@ -516,12 +555,13 @@ func (m tuiModel) handleEnter() (tea.Model, tea.Cmd) {
 		m.err = ""
 		m.page = 1
 		m.state = viewLoading
-		cfg := loadConfig()
+		cfg := config.Load()
 		return m, doSearch(m.query, cfg.ResultsPerPage, sortOptions[m.sortIdx], "-1", m.page)
 
 	case viewSearch:
 		if len(m.models) > 0 && m.selected < len(m.models) {
 			m.repo = m.models[m.selected].ID
+			m.modelLastMod = m.models[m.selected].LastModified
 			m.state = viewLoading
 			return m, doListFiles(m.repo)
 		}
@@ -532,8 +572,8 @@ func (m tuiModel) handleEnter() (tea.Model, tea.Cmd) {
 			if entry.IsMmproj {
 				break
 			}
-			cfg := loadConfig()
-			destDir := filepath.Join(expandHome(cfg.DownloadsDir), m.repo)
+			cfg := config.Load()
+			destDir := filepath.Join(display.ExpandHome(cfg.DownloadsDir), m.repo)
 
 			m.dlQueue = entry.Paths
 			m.dlQueueIdx = 0
@@ -547,7 +587,7 @@ func (m tuiModel) handleEnter() (tea.Model, tea.Cmd) {
 
 			firstPath := entry.Paths[0]
 			m.dlDestPath = filepath.Join(destDir, filepath.Base(firstPath))
-			url := getDownloadURL(m.repo, firstPath)
+			url := api.GetDownloadURL(m.repo, firstPath)
 			return m, doDownload(url, m.dlDestPath, entry.TotalSize, entry.Paths[1:])
 		}
 
@@ -555,7 +595,7 @@ func (m tuiModel) handleEnter() (tea.Model, tea.Cmd) {
 		if m.dlDone {
 			if m.dlOK {
 				hasMmproj := false
-				var mmprojEntry *DetailEntry
+				var mmprojEntry *models.DetailEntry
 				for i := range m.entries {
 					if m.entries[i].IsMmproj && !m.entries[i].Downloaded {
 						hasMmproj = true
@@ -569,8 +609,8 @@ func (m tuiModel) handleEnter() (tea.Model, tea.Cmd) {
 					return m, nil
 				}
 			}
-			mf := parseModelFiles(m.rawFiles)
-			m.entries = buildDetailEntries(mf, m.repo)
+			mf := api.ParseModelFiles(m.rawFiles)
+			m.entries = api.BuildDetailEntries(mf, m.repo)
 			m.state = viewDetail
 			return m, nil
 		}
@@ -587,6 +627,10 @@ func (m tuiModel) handleUp() (tea.Model, tea.Cmd) {
 			if m.selected < m.scrollOff {
 				m.scrollOff = m.selected
 			}
+		} else {
+			m.state = viewInput
+			m.input.SetValue(m.query)
+			m.input.Focus()
 		}
 	case viewDetail:
 		if m.detailFocus == 1 {
@@ -668,14 +712,15 @@ func (m tuiModel) handleScrollDown() (tea.Model, tea.Cmd) {
 }
 
 func (m tuiModel) handleLocalUp() (tea.Model, tea.Cmd) {
-	rows := m.localRows()
 	if m.localCursor > 0 {
 		m.localCursor--
 		if m.localCursor < m.localScroll {
 			m.localScroll = m.localCursor
 		}
+	} else {
+		m.localFocus = false
+		m.input.Focus()
 	}
-	_ = rows
 	return m, nil
 }
 
@@ -694,10 +739,6 @@ func (m tuiModel) handleLocalDown() (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-type serverLogMsg struct {
-	line string
-}
-
 func waitForServerLog(ch chan string) tea.Cmd {
 	return func() tea.Msg {
 		line, ok := <-ch
@@ -714,8 +755,8 @@ func (m *tuiModel) runLocalFile(row *localRow) tea.Cmd {
 	}
 	mod := m.localModels[row.repoIdx]
 	f := mod.Files[row.fileIdx]
-	cfg := loadConfig()
-	modelPath := filepath.Join(expandHome(cfg.DownloadsDir), mod.Repo, f.Name)
+	cfg := config.Load()
+	modelPath := filepath.Join(display.ExpandHome(cfg.DownloadsDir), mod.Repo, f.Name)
 	runCmd := cfg.RunCommand
 	runCmd = strings.ReplaceAll(runCmd, "{model}", "'"+modelPath+"'")
 	c := exec.Command("/bin/sh", "-c", runCmd)
@@ -768,11 +809,11 @@ func (m tuiModel) View() string {
 		if m.viewLogs {
 			return m.viewServerLogs()
 		}
-		return m.viewInput()
+		return m.viewInputScreen()
 	case viewLoading:
 		return m.viewLoading()
 	case viewSearch:
-		return m.viewSearch()
+		return m.viewSearchScreen()
 	case viewDetail:
 		return m.viewDetail()
 	case viewDownloading:
@@ -797,114 +838,7 @@ var (
 	headerStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("14"))
 	mmprojTag     = lipgloss.NewStyle().Foreground(lipgloss.Color("13")).Bold(true)
 	downloadedTag = lipgloss.NewStyle().Foreground(lipgloss.Color("10")).Bold(true)
-	boxStyle      = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(0, 1)
-	focusedBox    = lipgloss.NewStyle().Border(lipgloss.DoubleBorder()).Padding(0, 1).BorderForeground(lipgloss.Color("14"))
 )
-
-func stripHTML(s string) string {
-	var out strings.Builder
-	inTag := false
-	inEntity := false
-	for i := 0; i < len(s); i++ {
-		if s[i] == '<' {
-			inTag = true
-			continue
-		}
-		if s[i] == '>' && inTag {
-			inTag = false
-			continue
-		}
-		if s[i] == '&' {
-			inEntity = true
-			continue
-		}
-		if s[i] == ';' && inEntity {
-			inEntity = false
-			continue
-		}
-		if !inTag && !inEntity {
-			out.WriteByte(s[i])
-		}
-	}
-	return out.String()
-}
-
-func stripMarkdown(s string) string {
-	s = stripHTML(s)
-	lines := strings.Split(s, "\n")
-	var out strings.Builder
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-
-		if strings.HasPrefix(trimmed, "```") {
-			continue
-		}
-		if strings.HasPrefix(trimmed, "---") {
-			continue
-		}
-		if strings.HasPrefix(trimmed, "![") {
-			continue
-		}
-		if strings.HasPrefix(trimmed, "| ") {
-			continue
-		}
-
-		line = strings.TrimPrefix(line, "### ")
-		line = strings.TrimPrefix(line, "## ")
-		line = strings.TrimPrefix(line, "# ")
-		line = strings.TrimPrefix(line, "- ")
-		line = strings.TrimPrefix(line, "* ")
-		line = strings.TrimPrefix(line, "> ")
-
-		for strings.Contains(line, "**") {
-			line = strings.Replace(line, "**", "", 1)
-		}
-		for strings.Contains(line, "__") {
-			line = strings.Replace(line, "__", "", 1)
-		}
-		line = strings.ReplaceAll(line, "`", "")
-
-		if len(strings.TrimSpace(line)) > 0 {
-			out.WriteString(line)
-			out.WriteString("\n")
-		}
-	}
-	return out.String()
-}
-
-func regexpReplace(s, pattern, repl string) string {
-	return s
-}
-
-func wordWrap(text string, width int) string {
-	if width <= 0 {
-		return text
-	}
-	var b strings.Builder
-	lines := strings.Split(text, "\n")
-	for _, line := range lines {
-		if len(line) == 0 {
-			b.WriteString("\n")
-			continue
-		}
-		words := strings.Fields(line)
-		lineLen := 0
-		for _, word := range words {
-			if lineLen+len(word)+1 > width {
-				b.WriteString("\n")
-				lineLen = 0
-			}
-			if lineLen > 0 {
-				b.WriteString(" ")
-				lineLen++
-			}
-			b.WriteString(word)
-			lineLen += len(word)
-		}
-		b.WriteString("\n")
-	}
-	return b.String()
-}
 
 func (m tuiModel) viewHelp() string {
 	var b strings.Builder
@@ -928,14 +862,14 @@ func (m tuiModel) viewHelp() string {
 	}
 
 	for _, item := range helpItems {
-		b.WriteString(fmt.Sprintf("  %s%-12s%s  %s\n", cyan, item.key, reset, item.desc))
+		b.WriteString(fmt.Sprintf("  %s%-12s%s  %s\n", display.Cyan, item.key, display.Reset, item.desc))
 	}
 
 	b.WriteString("\n" + helpStyle.Render("Press ? or Esc to close"))
 	return b.String()
 }
 
-func (m tuiModel) viewInput() string {
+func (m tuiModel) viewInputScreen() string {
 	var b strings.Builder
 	b.WriteString(titleStyle.Render("lm-get"))
 	b.WriteString(dimStyle.Render(" — Search and download GGUF models from Hugging Face"))
@@ -971,7 +905,7 @@ func (m tuiModel) viewInput() string {
 			panelTitle = dimStyle.Render("Downloaded Models")
 		}
 		b.WriteString(panelTitle)
-		localSortLabel := localSortNames[m.localSortBy]
+		localSortLabel := models.LocalSortNames[m.localSortBy]
 		b.WriteString(dimStyle.Render(fmt.Sprintf(" (%d models, sort: %s)", len(m.localModels), localSortLabel)))
 		b.WriteString("\n")
 
@@ -1009,20 +943,20 @@ func (m tuiModel) viewInput() string {
 
 			if r.isFile {
 				f := mod.Files[r.fileIdx]
-				relTime := relativeTime(f.ModTime)
-				fname := truncate(f.Name, nameW-2)
-				line := fmt.Sprintf("  %-*s  %-9s  %-12s", nameW-2, fname, formatSize(f.Size), relTime)
+				relTime := display.RelativeTime(f.ModTime)
+				fname := display.Truncate(f.Name, nameW-2)
+				line := fmt.Sprintf("  %-*s  %-9s  %-12s", nameW-2, fname, display.FormatSize(f.Size), relTime)
 				b.WriteString(cursor)
 				b.WriteString(style.Render(line))
 			} else {
-				relTime := relativeTime(mod.ModTime)
+				relTime := display.RelativeTime(mod.ModTime)
 				expandIcon := "▸"
 				if mod.Expanded {
 					expandIcon = "▾"
 				}
-				name := truncate(mod.Repo, nameW-3)
+				name := display.Truncate(mod.Repo, nameW-3)
 				line := fmt.Sprintf("%s %-*s  %-9s  %2d files  %-12s",
-					expandIcon, nameW-3, name, formatSize(mod.Size), len(mod.Files), relTime)
+					expandIcon, nameW-3, name, display.FormatSize(mod.Size), len(mod.Files), relTime)
 				b.WriteString(cursor)
 				b.WriteString(style.Render(line))
 			}
@@ -1048,7 +982,7 @@ func (m tuiModel) viewLoading() string {
 	return fmt.Sprintf("\n  Loading...\n\n  %s", helpStyle.Render("Please wait"))
 }
 
-func (m tuiModel) viewSearch() string {
+func (m tuiModel) viewSearchScreen() string {
 	var b strings.Builder
 
 	sortLabel := sortOptions[m.sortIdx]
@@ -1070,6 +1004,10 @@ func (m tuiModel) viewSearch() string {
 		nameColW = 55
 	}
 
+	b.WriteString(dimStyle.Render(fmt.Sprintf("  %-"+fmt.Sprintf("%d", nameColW)+"s  %-9s  %-8s  %-7s  %-12s",
+		"Model", "Downloads", "Likes", "Files", "Updated")))
+	b.WriteString("\n")
+
 	for i := m.scrollOff; i < end; i++ {
 		mod := m.models[i]
 		cursor := "  "
@@ -1079,10 +1017,13 @@ func (m tuiModel) viewSearch() string {
 			style = selStyle
 		}
 
-		t, _ := time.Parse(time.RFC3339, mod.LastModified)
+		t, err := time.Parse(time.RFC3339, mod.LastModified)
+		if err != nil {
+			t, _ = time.Parse(time.RFC3339Nano, mod.LastModified)
+		}
 		relTime := ""
 		if !t.IsZero() {
-			relTime = relativeTime(t)
+			relTime = display.RelativeTime(t)
 		}
 
 		ggufCount := 0
@@ -1092,9 +1033,9 @@ func (m tuiModel) viewSearch() string {
 			}
 		}
 
-		name := truncate(mod.ID, nameColW)
+		name := display.Truncate(mod.ID, nameColW)
 		line := fmt.Sprintf("%-"+fmt.Sprintf("%d", nameColW)+"s  ↓%-8s  ♥%-7s  %-7s  %-12s",
-			name, formatNumber(mod.Downloads), formatNumber(mod.Likes), fmt.Sprintf("%d GGUF", ggufCount), relTime)
+			name, display.FormatNumber(mod.Downloads), display.FormatNumber(mod.Likes), fmt.Sprintf("%d GGUF", ggufCount), relTime)
 
 		b.WriteString(cursor)
 		b.WriteString(style.Render(line))
@@ -1130,8 +1071,8 @@ func (m tuiModel) viewDetail() string {
 	leftB.WriteString("\n")
 
 	if m.readme != "" {
-		clean := stripMarkdown(m.readme)
-		wrapped := wordWrap(clean, halfW-2)
+		clean := display.RenderMarkdown(m.readme, halfW-2)
+		wrapped := display.WordWrap(clean, halfW-2)
 		lines := strings.Split(wrapped, "\n")
 		totalLines := len(lines)
 		start := m.readmeScroll
@@ -1147,7 +1088,7 @@ func (m tuiModel) viewDetail() string {
 		}
 		for _, l := range lines[start:end] {
 			if lipgloss.Width(l) > halfW {
-				l = truncate(l, halfW)
+				l = display.Truncate(l, halfW)
 			}
 			leftB.WriteString(l)
 			leftB.WriteString("\n")
@@ -1201,8 +1142,8 @@ func (m tuiModel) viewDetail() string {
 			nameW = 8
 		}
 
-		name := truncate(e.DisplayName, nameW)
-		sizeStr := fmt.Sprintf("%*s", sizeW, formatSize(e.TotalSize))
+		name := display.Truncate(e.DisplayName, nameW)
+		sizeStr := fmt.Sprintf("%*s", sizeW, display.FormatSize(e.TotalSize))
 
 		visStr := fmt.Sprintf("%-*s", visW, "")
 		if e.IsMmproj {
@@ -1240,7 +1181,18 @@ func (m tuiModel) viewDetail() string {
 
 	joined := lipgloss.JoinHorizontal(lipgloss.Top, leftPane, rightPane)
 
-	return headerStyle.Render(m.repo) + "\n" + joined + "\n" +
+	var headerExtra string
+	if m.modelLastMod != "" {
+		t, err := time.Parse(time.RFC3339, m.modelLastMod)
+		if err != nil {
+			t, _ = time.Parse(time.RFC3339Nano, m.modelLastMod)
+		}
+		if !t.IsZero() {
+			headerExtra = dimStyle.Render(" · updated " + display.RelativeTime(t))
+		}
+	}
+
+	return headerStyle.Render(m.repo) + headerExtra + "\n" + joined + "\n" +
 		helpStyle.Render("Tab switch · ↑/↓ nav · Enter download · ? help · Esc back")
 }
 
@@ -1277,7 +1229,7 @@ func (m tuiModel) viewDownloading() string {
 		bar.WriteString("]")
 
 		b.WriteString(fmt.Sprintf("  %s %.1f%%\n", bar.String(), pct))
-		b.WriteString(fmt.Sprintf("  %s / %s\n", formatSize(m.dlCurrent), formatSize(m.dlTotal)))
+		b.WriteString(fmt.Sprintf("  %s / %s\n", display.FormatSize(m.dlCurrent), display.FormatSize(m.dlTotal)))
 		b.WriteString("\n" + helpStyle.Render("Please wait... · Esc to quit"))
 	}
 
@@ -1290,7 +1242,7 @@ func (m tuiModel) viewMmprojPrompt() string {
 	b.WriteString("\n\n")
 	b.WriteString("This model supports vision and has mmproj files available.\n\n")
 	if m.mmprojEntry != nil {
-		b.WriteString(fmt.Sprintf("  %s (%s)\n\n", m.mmprojEntry.DisplayName, formatSize(m.mmprojEntry.TotalSize)))
+		b.WriteString(fmt.Sprintf("  %s (%s)\n\n", m.mmprojEntry.DisplayName, display.FormatSize(m.mmprojEntry.TotalSize)))
 	}
 	b.WriteString(helpStyle.Render("Download mmproj? "))
 	b.WriteString(greenStyle.Render("[y] Yes") + "  " + redStyle.Render("[n] No"))
@@ -1347,23 +1299,23 @@ func (m tuiModel) viewServerLogs() string {
 
 func doSearch(query string, limit int, sortBy string, direction string, page int) tea.Cmd {
 	return func() tea.Msg {
-		models, err := searchModels(query, limit, sortBy, direction, page)
-		return searchResultMsg{models: models, err: err}
+		hfModels, err := api.SearchModels(query, limit, sortBy, direction, page)
+		return searchResultMsg{models: hfModels, err: err}
 	}
 }
 
 func doListFiles(repo string) tea.Cmd {
 	return func() tea.Msg {
-		files, err := listFiles(repo)
+		files, err := api.ListFiles(repo)
 		var readme string
 		if err == nil {
-			readme, _ = fetchReadme(repo)
+			readme, _ = api.FetchReadme(repo)
 		}
 		return filesResultMsg{files: files, readme: readme, err: err}
 	}
 }
 
-func doDownload(url, destPath string, expectedSize int64, remainingPaths []string) tea.Cmd {
+func doDownload(downloadURL, destPath string, expectedSize int64, remainingPaths []string) tea.Cmd {
 	progress := make(chan dlProgressMsg, 64)
 
 	go func() {
@@ -1375,15 +1327,23 @@ func doDownload(url, destPath string, expectedSize int64, remainingPaths []strin
 
 		_ = os.MkdirAll(filepath.Dir(destPath), 0755)
 
-		freeSpace := getDiskFree(filepath.Dir(destPath))
+		freeSpace := api.GetDiskFree(filepath.Dir(destPath))
 		if freeSpace >= 0 && expectedSize > freeSpace {
 			sendDone(false)
 			return
 		}
 
+		progressCh := make(chan int64, 64)
+		go func() {
+			defer close(progressCh)
+			for cur := range progressCh {
+				progress <- dlProgressMsg{current: cur, total: expectedSize, ch: progress}
+			}
+		}()
+
 		var err error
 		for attempt := 0; attempt < 3; attempt++ {
-			err = downloadToFile(url, destPath, progress)
+			err = download.ToFile(downloadURL, destPath, progressCh)
 			if err == nil {
 				break
 			}
@@ -1413,92 +1373,13 @@ func doDownload(url, destPath string, expectedSize int64, remainingPaths []strin
 	return waitForProgress(progress)
 }
 
-func downloadToFile(url, destPath string, progress chan dlProgressMsg) error {
-	var existingSize int64
-	if info, err := os.Stat(destPath); err == nil {
-		existingSize = info.Size()
-	}
-
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return err
-	}
-	if existingSize > 0 {
-		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", existingSize))
-	}
-	req.Header.Set("User-Agent", "lm-get/"+version)
-
-	resp, err := dlClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
-		return fmt.Errorf("HTTP %d", resp.StatusCode)
-	}
-
-	total := resp.ContentLength
-	if resp.StatusCode == http.StatusPartialContent {
-		total += existingSize
-	} else {
-		existingSize = 0
-	}
-
-	flags := os.O_CREATE | os.O_WRONLY
-	if existingSize > 0 {
-		flags |= os.O_APPEND
-	} else {
-		flags |= os.O_TRUNC
-	}
-
-	f, err := os.OpenFile(destPath, flags, 0644)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	if existingSize > 0 {
-		f.Seek(0, io.SeekEnd)
-	}
-
-	buf := make([]byte, 1024*1024)
-	var downloaded int64
-	lastSend := time.Now()
-
-	for {
-		n, readErr := resp.Body.Read(buf)
-		if n > 0 {
-			if _, writeErr := f.Write(buf[:n]); writeErr != nil {
-				return writeErr
-			}
-			downloaded += int64(n)
-
-			now := time.Now()
-			if now.Sub(lastSend) > 150*time.Millisecond {
-				lastSend = now
-				progress <- dlProgressMsg{current: existingSize + downloaded, total: total, ch: progress}
-			}
-		}
-		if readErr == io.EOF {
-			break
-		}
-		if readErr != nil {
-			return readErr
-		}
-	}
-
-	f.Sync()
-	return nil
-}
-
 func waitForProgress(ch chan dlProgressMsg) tea.Cmd {
 	return func() tea.Msg {
 		return <-ch
 	}
 }
 
-func runTUI() error {
+func Run() error {
 	m := newTUIModel()
 	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
 	_, err := p.Run()

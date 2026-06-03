@@ -1,4 +1,4 @@
-package main
+package api
 
 import (
 	"encoding/json"
@@ -11,61 +11,28 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/loq/lm-get/internal/cache"
+	"github.com/loq/lm-get/internal/config"
+	"github.com/loq/lm-get/internal/display"
+	"github.com/loq/lm-get/internal/models"
 )
 
-type HFModel struct {
-	ID           string `json:"id"`
-	Downloads    int    `json:"downloads"`
-	Likes        int    `json:"likes"`
-	LastModified string `json:"lastModified"`
-	Siblings     []struct {
-		RFilename string `json:"rfilename"`
-	} `json:"siblings"`
-}
+var Version = "dev"
 
-type HFFileTree struct {
-	Type string `json:"type"`
-	Path string `json:"path"`
-	Size int64  `json:"size"`
-	OID  string `json:"oid"`
-	LFS  *struct {
-		Size int64 `json:"size"`
-	} `json:"lfs"`
-}
+var APIClient = &http.Client{Timeout: 30 * time.Second}
 
-type ModelFile struct {
-	Path       string
-	Size       int64
-	IsMmproj   bool
-	IsShard    bool
-	ShardGroup string
-	ShardIndex int
-	ShardTotal int
-}
-
-type DetailEntry struct {
-	DisplayName string
-	Paths       []string
-	TotalSize   int64
-	IsMmproj    bool
-	IsShard     bool
-	ShardTotal  int
-	Downloaded  bool
-}
-
-var apiClient = &http.Client{Timeout: 30 * time.Second}
-
-var dlClient = &http.Client{
+var DLClient = &http.Client{
 	Timeout: 0,
 	Transport: &http.Transport{
-		MaxIdleConns:        10,
-		IdleConnTimeout:     90 * time.Second,
-		DisableCompression:  true,
+		MaxIdleConns:       10,
+		IdleConnTimeout:    90 * time.Second,
+		DisableCompression: true,
 	},
 }
 
 func hfGet(rawURL string) ([]byte, error) {
-	cached := cacheGet(rawURL)
+	cached := cache.Get(rawURL)
 	if cached != nil {
 		return cached, nil
 	}
@@ -75,7 +42,7 @@ func hfGet(rawURL string) ([]byte, error) {
 	for attempt := 0; attempt < 3; attempt++ {
 		data, err = hfGetOnce(rawURL)
 		if err == nil {
-			cacheSet(rawURL, data)
+			cache.Set(rawURL, data)
 			return data, nil
 		}
 		if attempt < 2 {
@@ -90,9 +57,9 @@ func hfGetOnce(rawURL string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("User-Agent", "lm-get/"+version)
+	req.Header.Set("User-Agent", "lm-get/"+Version)
 
-	resp, err := apiClient.Do(req)
+	resp, err := APIClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -105,7 +72,7 @@ func hfGetOnce(rawURL string) ([]byte, error) {
 	return io.ReadAll(resp.Body)
 }
 
-func searchModels(query string, limit int, sortBy string, direction string, page int) ([]HFModel, error) {
+func SearchModels(query string, limit int, sortBy string, direction string, page int) ([]models.HFModel, error) {
 	if direction == "" {
 		direction = "-1"
 	}
@@ -134,17 +101,17 @@ func searchModels(query string, limit int, sortBy string, direction string, page
 		return nil, err
 	}
 
-	var models []HFModel
-	if err := json.Unmarshal(data, &models); err != nil {
+	var hfModels []models.HFModel
+	if err := json.Unmarshal(data, &hfModels); err != nil {
 		return nil, fmt.Errorf("failed to parse response: %w", err)
 	}
 
-	return filterGGUF(models), nil
+	return FilterGGUF(hfModels), nil
 }
 
-func filterGGUF(models []HFModel) []HFModel {
-	var result []HFModel
-	for _, m := range models {
+func FilterGGUF(hfModels []models.HFModel) []models.HFModel {
+	var result []models.HFModel
+	for _, m := range hfModels {
 		for _, s := range m.Siblings {
 			if strings.HasSuffix(strings.ToLower(s.RFilename), ".gguf") {
 				result = append(result, m)
@@ -155,18 +122,18 @@ func filterGGUF(models []HFModel) []HFModel {
 	return result
 }
 
-func listFiles(repo string) ([]HFFileTree, error) {
+func ListFiles(repo string) ([]models.HFFileTree, error) {
 	data, err := hfGet("https://huggingface.co/api/models/" + repo + "/tree/main")
 	if err != nil {
 		return nil, err
 	}
 
-	var files []HFFileTree
+	var files []models.HFFileTree
 	if err := json.Unmarshal(data, &files); err != nil {
 		return nil, fmt.Errorf("failed to parse response: %w", err)
 	}
 
-	var gguf []HFFileTree
+	var gguf []models.HFFileTree
 	for _, f := range files {
 		if f.Type == "file" && strings.HasSuffix(f.Path, ".gguf") {
 			gguf = append(gguf, f)
@@ -181,18 +148,18 @@ func listFiles(repo string) ([]HFFileTree, error) {
 	return gguf, nil
 }
 
-func listSubDir(repo, dirPath string) ([]HFFileTree, error) {
+func listSubDir(repo, dirPath string) ([]models.HFFileTree, error) {
 	data, err := hfGet("https://huggingface.co/api/models/" + repo + "/tree/main/" + dirPath)
 	if err != nil {
 		return nil, err
 	}
 
-	var files []HFFileTree
+	var files []models.HFFileTree
 	if err := json.Unmarshal(data, &files); err != nil {
 		return nil, err
 	}
 
-	var gguf []HFFileTree
+	var gguf []models.HFFileTree
 	for _, f := range files {
 		if f.Type == "file" && strings.HasSuffix(f.Path, ".gguf") {
 			gguf = append(gguf, f)
@@ -201,8 +168,8 @@ func listSubDir(repo, dirPath string) ([]HFFileTree, error) {
 	return gguf, nil
 }
 
-func parseModelFiles(rawFiles []HFFileTree) []ModelFile {
-	var files []ModelFile
+func ParseModelFiles(rawFiles []models.HFFileTree) []models.ModelFile {
+	var files []models.ModelFile
 	for _, f := range rawFiles {
 		size := f.Size
 		if f.LFS != nil && f.LFS.Size > 0 {
@@ -210,7 +177,7 @@ func parseModelFiles(rawFiles []HFFileTree) []ModelFile {
 		}
 
 		name := filepath.Base(f.Path)
-		mf := ModelFile{
+		mf := models.ModelFile{
 			Path: f.Path,
 			Size: size,
 		}
@@ -219,7 +186,7 @@ func parseModelFiles(rawFiles []HFFileTree) []ModelFile {
 			mf.IsMmproj = true
 		}
 
-		if idx, total, ok := parseShardPattern(name); ok {
+		if idx, total, ok := ParseShardPattern(name); ok {
 			mf.IsShard = true
 			mf.ShardIndex = idx
 			mf.ShardTotal = total
@@ -231,10 +198,10 @@ func parseModelFiles(rawFiles []HFFileTree) []ModelFile {
 	return files
 }
 
-func buildDetailEntries(files []ModelFile, repo string) []DetailEntry {
-	shardGroups := map[string][]ModelFile{}
-	var singles []ModelFile
-	var mmprojFiles []ModelFile
+func BuildDetailEntries(files []models.ModelFile, repo string) []models.DetailEntry {
+	shardGroups := map[string][]models.ModelFile{}
+	var singles []models.ModelFile
+	var mmprojFiles []models.ModelFile
 
 	for _, f := range files {
 		if f.IsMmproj {
@@ -248,14 +215,14 @@ func buildDetailEntries(files []ModelFile, repo string) []DetailEntry {
 		singles = append(singles, f)
 	}
 
-	var entries []DetailEntry
+	var entries []models.DetailEntry
 
 	for _, f := range singles {
-		entries = append(entries, DetailEntry{
+		entries = append(entries, models.DetailEntry{
 			DisplayName: filepath.Base(f.Path),
 			Paths:       []string{f.Path},
 			TotalSize:   f.Size,
-			Downloaded:  isFileDownloaded(repo, f.Path),
+			Downloaded:  IsFileDownloaded(repo, f.Path),
 		})
 	}
 
@@ -266,11 +233,11 @@ func buildDetailEntries(files []ModelFile, repo string) []DetailEntry {
 		for _, s := range shards {
 			totalSize += s.Size
 			paths = append(paths, s.Path)
-			if !isFileDownloaded(repo, s.Path) {
+			if !IsFileDownloaded(repo, s.Path) {
 				allDownloaded = false
 			}
 		}
-		entries = append(entries, DetailEntry{
+		entries = append(entries, models.DetailEntry{
 			DisplayName: name,
 			Paths:       paths,
 			TotalSize:   totalSize,
@@ -281,19 +248,19 @@ func buildDetailEntries(files []ModelFile, repo string) []DetailEntry {
 	}
 
 	for _, f := range mmprojFiles {
-		entries = append(entries, DetailEntry{
+		entries = append(entries, models.DetailEntry{
 			DisplayName: filepath.Base(f.Path),
 			Paths:       []string{f.Path},
 			TotalSize:   f.Size,
 			IsMmproj:    true,
-			Downloaded:  isFileDownloaded(repo, f.Path),
+			Downloaded:  IsFileDownloaded(repo, f.Path),
 		})
 	}
 
 	return entries
 }
 
-func parseShardPattern(name string) (int, int, bool) {
+func ParseShardPattern(name string) (int, int, bool) {
 	lower := strings.ToLower(name)
 	if !strings.Contains(lower, "-of-") || !strings.HasSuffix(lower, ".gguf") {
 		return 0, 0, false
@@ -322,10 +289,10 @@ func parseShardPattern(name string) (int, int, bool) {
 	return 0, 0, false
 }
 
-func isFileDownloaded(repo, filePath string) bool {
-	cfg := loadConfig()
+func IsFileDownloaded(repo, filePath string) bool {
+	cfg := config.Load()
 	base := filepath.Base(filePath)
-	localPath := filepath.Join(expandHome(cfg.DownloadsDir), repo, base)
+	localPath := filepath.Join(display.ExpandHome(cfg.DownloadsDir), repo, base)
 	info, err := os.Stat(localPath)
 	if err != nil {
 		return false
@@ -333,11 +300,11 @@ func isFileDownloaded(repo, filePath string) bool {
 	return info.Size() > 0
 }
 
-func getDownloadURL(repo, filePath string) string {
+func GetDownloadURL(repo, filePath string) string {
 	return fmt.Sprintf("https://huggingface.co/%s/resolve/main/%s?download=true", repo, filePath)
 }
 
-func fetchReadme(repo string) (string, error) {
+func FetchReadme(repo string) (string, error) {
 	urls := []string{
 		"https://huggingface.co/" + repo + "/raw/main/README.md",
 		"https://huggingface.co/" + repo + "/raw/main/readme.md",
@@ -351,10 +318,23 @@ func fetchReadme(repo string) (string, error) {
 	return "", fmt.Errorf("no README found")
 }
 
-func getDiskFree(path string) int64 {
+func GetDiskFree(path string) int64 {
 	var stat syscall.Statfs_t
 	if err := syscall.Statfs(path, &stat); err != nil {
 		return -1
 	}
 	return int64(stat.Bavail) * int64(stat.Bsize)
+}
+
+func HasMmprojFiles(repo string) bool {
+	rawFiles, err := ListFiles(repo)
+	if err != nil {
+		return false
+	}
+	for _, f := range rawFiles {
+		if strings.HasPrefix(strings.ToLower(filepath.Base(f.Path)), "mmproj") {
+			return true
+		}
+	}
+	return false
 }

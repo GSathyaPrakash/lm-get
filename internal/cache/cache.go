@@ -1,4 +1,4 @@
-package main
+package cache
 
 import (
 	"encoding/json"
@@ -6,6 +6,9 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/loq/lm-get/internal/config"
+	"github.com/loq/lm-get/internal/display"
 )
 
 type CacheEntry struct {
@@ -21,6 +24,12 @@ func initCache() {
 	os.MkdirAll(cacheDir, 0755)
 }
 
+func ensureInit() {
+	if cacheDir == "" {
+		initCache()
+	}
+}
+
 func cacheKey(url string) string {
 	h := 0
 	for _, c := range url {
@@ -29,10 +38,8 @@ func cacheKey(url string) string {
 	return filepath.Join(cacheDir, fmt.Sprintf("%x.json", h))
 }
 
-func cacheGet(url string) []byte {
-	if cacheDir == "" {
-		initCache()
-	}
+func Get(url string) []byte {
+	ensureInit()
 	data, err := os.ReadFile(cacheKey(url))
 	if err != nil {
 		return nil
@@ -41,7 +48,7 @@ func cacheGet(url string) []byte {
 	if err := json.Unmarshal(data, &entry); err != nil {
 		return nil
 	}
-	cfg := loadConfig()
+	cfg := config.Load()
 	ttl := float64(cfg.CacheTTL)
 	if ttl == 0 {
 		ttl = 300
@@ -52,10 +59,8 @@ func cacheGet(url string) []byte {
 	return entry.Data
 }
 
-func cacheSet(url string, data []byte) {
-	if cacheDir == "" {
-		initCache()
-	}
+func Set(url string, data []byte) {
+	ensureInit()
 	entry := CacheEntry{
 		Data:      data,
 		FetchedAt: float64(time.Now().Unix()),
@@ -67,10 +72,8 @@ func cacheSet(url string, data []byte) {
 	os.WriteFile(cacheKey(url), encoded, 0644)
 }
 
-func cacheClear() error {
-	if cacheDir == "" {
-		initCache()
-	}
+func Clear() error {
+	ensureInit()
 	entries, err := os.ReadDir(cacheDir)
 	if err != nil {
 		return err
@@ -81,10 +84,8 @@ func cacheClear() error {
 	return nil
 }
 
-func cacheInfo() (int64, int) {
-	if cacheDir == "" {
-		initCache()
-	}
+func Info() (int64, int) {
+	ensureInit()
 	entries, err := os.ReadDir(cacheDir)
 	if err != nil {
 		return 0, 0
@@ -98,4 +99,24 @@ func cacheInfo() (int64, int) {
 		}
 	}
 	return totalSize, count
+}
+
+func CmdCache(args []string) {
+	if len(args) == 0 {
+		fmt.Println("Usage: lm-get cache [clear|info]")
+		return
+	}
+	switch args[0] {
+	case "clear":
+		if err := Clear(); err != nil {
+			display.PrintError("Failed to clear cache: %v", err)
+			return
+		}
+		fmt.Printf("%s✓ Cache cleared%s\n", display.Green, display.Reset)
+	case "info":
+		size, count := Info()
+		fmt.Printf("Cache: %d entries, %s\n", count, display.FormatSize(size))
+	default:
+		display.PrintError("Unknown cache command: %s", args[0])
+	}
 }

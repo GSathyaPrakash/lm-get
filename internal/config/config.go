@@ -1,10 +1,12 @@
-package main
+package config
 
 import (
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"github.com/loq/lm-get/internal/display"
 )
 
 type Config struct {
@@ -15,7 +17,7 @@ type Config struct {
 	RunCommand     string `json:"run_command"`
 }
 
-func defaultConfig() Config {
+func Default() Config {
 	return Config{
 		DownloadsDir:   "~/Models",
 		ResultsPerPage: 20,
@@ -25,7 +27,7 @@ func defaultConfig() Config {
 	}
 }
 
-func (c Config) validate() Config {
+func (c Config) Validate() Config {
 	if c.ResultsPerPage <= 0 {
 		c.ResultsPerPage = 20
 	}
@@ -48,63 +50,43 @@ func (c Config) validate() Config {
 	return c
 }
 
-func configPath() string {
+func Path() string {
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, ".config", "lm-get", "config.json")
 }
 
-func loadConfig() Config {
-	cfg := defaultConfig()
-	data, err := os.ReadFile(configPath())
+func Load() Config {
+	cfg := Default()
+	data, err := os.ReadFile(Path())
 	if err != nil {
 		return cfg
 	}
 	json.Unmarshal(data, &cfg)
-	return cfg.validate()
+	return cfg.Validate()
 }
 
-func saveConfig(cfg Config) error {
-	path := configPath()
+func Save(cfg Config) error {
+	path := Path()
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return err
 	}
-	data, err := json.MarshalIndent(cfg.validate(), "", "  ")
+	data, err := json.MarshalIndent(cfg.Validate(), "", "  ")
 	if err != nil {
 		return err
 	}
 	return os.WriteFile(path, data, 0644)
 }
 
-func cmdConfigInit() {
-	path := configPath()
+func CmdConfigInit() {
+	path := Path()
 	if _, err := os.Stat(path); err == nil {
 		fmt.Println("Config already exists at", path)
 		return
 	}
-	cfg := defaultConfig()
-	if err := saveConfig(cfg); err != nil {
-		printError("Failed to create config: %v", err)
+	cfg := Default()
+	if err := Save(cfg); err != nil {
+		display.PrintError("Failed to create config: %v", err)
 		return
 	}
-	fmt.Printf("%s✓ Config created at %s%s\n", green, path, reset)
-}
-
-func cmdCache(args []string) {
-	if len(args) == 0 {
-		fmt.Println("Usage: lm-get cache [clear|info]")
-		return
-	}
-	switch args[0] {
-	case "clear":
-		if err := cacheClear(); err != nil {
-			printError("Failed to clear cache: %v", err)
-			return
-		}
-		fmt.Printf("%s✓ Cache cleared%s\n", green, reset)
-	case "info":
-		size, count := cacheInfo()
-		fmt.Printf("Cache: %d entries, %s\n", count, formatSize(size))
-	default:
-		printError("Unknown cache command: %s", args[0])
-	}
+	fmt.Printf("%s✓ Config created at %s%s\n", display.Green, path, display.Reset)
 }

@@ -4,7 +4,7 @@ BINARY = lm-get
 .PHONY: build install clean
 
 build:
-	go build -o $(BINARY) .
+	go build -o $(BINARY) ./cmd/lm-get
 
 install: build
 	install -d $(DESTDIR)$(PREFIX)/bin
