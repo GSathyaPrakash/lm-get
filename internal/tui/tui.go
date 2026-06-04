@@ -19,6 +19,7 @@ import (
 	"github.com/loq/lm-get/internal/display"
 	"github.com/loq/lm-get/internal/download"
 	"github.com/loq/lm-get/internal/models"
+	"github.com/loq/lm-get/internal/server"
 )
 
 type view int
@@ -82,6 +83,7 @@ type tuiModel struct {
 	logCh         chan string
 	logAutoScroll bool
 	modelLastMod  string
+	serverStates  map[string]server.ServerEntry
 }
 
 type localRow struct {
@@ -153,17 +155,20 @@ func newTUIModel() tuiModel {
 	localModels := cli.ScanLocalModels()
 	cli.SortLocalModels(localModels, models.LocalSortTime)
 
+	states := server.Load()
+
 	return tuiModel{
-		state:       viewInput,
-		input:       ti,
-		totalRAM:    display.GetSystemRAM(),
-		sortIdx:     sortIdx,
-		windowW:     80,
-		windowH:     24,
-		page:        1,
+		state:         viewInput,
+		input:         ti,
+		totalRAM:      display.GetSystemRAM(),
+		sortIdx:       sortIdx,
+		windowW:       80,
+		windowH:       24,
+		page:          1,
 		localModels:   localModels,
 		localSortBy:   models.LocalSortTime,
 		logAutoScroll: true,
+		serverStates:  states,
 	}
 }
 
@@ -227,6 +232,7 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						p.Wait()
 					}
 					m.runningProcs = nil
+					m.clearRunningServer()
 					m.serverLogs = append(m.serverLogs, "", "[Server stopped]")
 					return m, nil
 				case "up":
@@ -236,12 +242,18 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 					return m, nil
 				case "down":
-					m.logScroll++
 					logH := m.windowH - 4
 					if logH < 5 {
 						logH = 10
 					}
-					if m.logScroll >= len(m.serverLogs)-logH {
+					maxScroll := len(m.serverLogs) - logH
+					if maxScroll < 0 {
+						maxScroll = 0
+					}
+					if m.logScroll < maxScroll {
+						m.logScroll++
+					}
+					if m.logScroll >= maxScroll {
 						m.logAutoScroll = true
 					}
 					return m, nil
@@ -325,6 +337,7 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 							p.Wait()
 						}
 						m.runningProcs = nil
+						m.clearRunningServer()
 						m.serverLogs = append(m.serverLogs, "", "[Server stopped]")
 						return m, nil
 					case "l":
@@ -432,20 +445,6 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
-	case tea.MouseMsg:
-		switch msg.Type {
-		case tea.MouseWheelUp:
-			if m.state == viewInput && m.localFocus {
-				return m.handleLocalUp()
-			}
-			return m.handleScrollUp()
-		case tea.MouseWheelDown:
-			if m.state == viewInput && m.localFocus {
-				return m.handleLocalDown()
-			}
-			return m.handleScrollDown()
-		}
-
 	case searchResultMsg:
 		if msg.err != nil {
 			m.err = msg.err.Error()
@@ -518,12 +517,31 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m *tuiModel) refreshLocal() {
 	m.localModels = cli.ScanLocalModels()
 	cli.SortLocalModels(m.localModels, m.localSortBy)
+	m.serverStates = server.Load()
 	if m.localCursor >= len(m.localModels) {
 		m.localCursor = len(m.localModels) - 1
 	}
 	if m.localCursor < 0 {
 		m.localCursor = 0
 	}
+}
+
+func (m *tuiModel) modelPathForRow(row *localRow) string {
+	if row == nil || !row.isFile {
+		return ""
+	}
+	mod := m.localModels[row.repoIdx]
+	f := mod.Files[row.fileIdx]
+	cfg := config.Load()
+	return filepath.Join(display.ExpandHome(cfg.DownloadsDir), mod.Repo, f.Name)
+}
+
+func (m *tuiModel) isRunning(modelPath string) bool {
+	e, ok := m.serverStates[modelPath]
+	if !ok {
+		return false
+	}
+	return server.IsAlive(e.PID)
 }
 
 func (m tuiModel) handleEsc() (tea.Model, tea.Cmd) {
@@ -757,8 +775,21 @@ func (m *tuiModel) runLocalFile(row *localRow) tea.Cmd {
 	f := mod.Files[row.fileIdx]
 	cfg := config.Load()
 	modelPath := filepath.Join(display.ExpandHome(cfg.DownloadsDir), mod.Repo, f.Name)
+
+	if m.isRunning(modelPath) {
+		return m.attachToRunning(modelPath, f.Name)
+	}
+
 	runCmd := cfg.RunCommand
 	runCmd = strings.ReplaceAll(runCmd, "{model}", "'"+modelPath+"'")
+
+	safeName := strings.ReplaceAll(mod.Repo, "/", "-") + "-" + f.Name
+	logPath := filepath.Join(server.LogDir(), safeName+".log")
+	logFile, err := os.Create(logPath)
+	if err != nil {
+		return nil
+	}
+
 	c := exec.Command("/bin/sh", "-c", runCmd)
 	c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	logR, logW, _ := os.Pipe()
@@ -767,9 +798,18 @@ func (m *tuiModel) runLocalFile(row *localRow) tea.Cmd {
 	if err := c.Start(); err != nil {
 		logW.Close()
 		logR.Close()
+		logFile.Close()
 		return nil
 	}
 	logW.Close()
+
+	server.Set(modelPath, server.ServerEntry{
+		PID:     c.Process.Pid,
+		Command: runCmd,
+		LogPath: logPath,
+	})
+	m.serverStates = server.Load()
+
 	m.runningProcs = append(m.runningProcs, c.Process)
 	m.serverName = f.Name
 	m.serverLogs = []string{fmt.Sprintf("$ %s", runCmd), ""}
@@ -777,11 +817,12 @@ func (m *tuiModel) runLocalFile(row *localRow) tea.Cmd {
 	m.viewLogs = true
 
 	m.logCh = make(chan string, 256)
-	go func(r *os.File, ch chan string) {
+	go func(r *os.File, ch chan string, lf *os.File) {
 		buf := make([]byte, 4096)
 		for {
 			n, err := r.Read(buf)
 			if n > 0 {
+				lf.Write(buf[:n])
 				chunk := string(buf[:n])
 				for _, l := range strings.Split(chunk, "\n") {
 					if l != "" {
@@ -794,10 +835,67 @@ func (m *tuiModel) runLocalFile(row *localRow) tea.Cmd {
 			}
 		}
 		r.Close()
+		lf.Close()
 		close(ch)
-	}(logR, m.logCh)
+	}(logR, m.logCh, logFile)
 
 	return waitForServerLog(m.logCh)
+}
+
+func (m *tuiModel) clearRunningServer() {
+	for mp, e := range m.serverStates {
+		for _, p := range m.runningProcs {
+			if p.Pid == e.PID {
+				server.Remove(mp)
+				break
+			}
+		}
+	}
+	m.serverStates = server.Load()
+}
+
+func (m *tuiModel) attachToRunning(modelPath string, name string) tea.Cmd {
+	e, ok := m.serverStates[modelPath]
+	if !ok || !server.IsAlive(e.PID) {
+		delete(m.serverStates, modelPath)
+		return nil
+	}
+
+	m.serverName = name
+	m.logScroll = 0
+	m.viewLogs = true
+	m.logAutoScroll = true
+
+	data, err := os.ReadFile(e.LogPath)
+	if err != nil {
+		m.serverLogs = []string{fmt.Sprintf("$ %s (pid %d, re-attached)", e.Command, e.PID), ""}
+		return nil
+	}
+
+	lines := strings.Split(string(data), "\n")
+	var filtered []string
+	for _, l := range lines {
+		if l != "" {
+			filtered = append(filtered, l)
+		}
+	}
+	m.serverLogs = append([]string{fmt.Sprintf("$ %s (pid %d, re-attached)", e.Command, e.PID), ""}, filtered...)
+
+	logH := m.windowH - 4
+	if logH < 5 {
+		logH = 10
+	}
+	m.logScroll = len(m.serverLogs) - logH
+	if m.logScroll < 0 {
+		m.logScroll = 0
+	}
+
+	proc, _ := os.FindProcess(e.PID)
+	if proc != nil {
+		m.runningProcs = append(m.runningProcs, proc)
+	}
+
+	return nil
 }
 
 func (m tuiModel) View() string {
@@ -845,21 +943,21 @@ func (m tuiModel) viewHelp() string {
 	b.WriteString(titleStyle.Render("lm-get — Help"))
 	b.WriteString("\n\n")
 
-	helpItems := []struct{ key, desc string }{
-		{"↑/k, ↓/j", "Navigate up/down"},
-		{"Enter", "Select / Download"},
-		{"Esc", "Go back"},
-		{"q", "Back / Quit"},
-		{"s", "Cycle sort (search or downloaded panel)"},
-		{"d", "Delete model (downloaded panel)"},
-		{"r", "Run model with llama-server (downloaded panel)"},
-		{"k", "Kill running server"},
-		{"l", "View server logs"},
-		{"←/→", "Previous/Next page (in search)"},
-		{"Tab", "Switch focus: search ↔ downloaded / README ↔ Files"},
-		{"?", "Toggle this help"},
-		{"Ctrl+C", "Force quit"},
-	}
+		helpItems := []struct{ key, desc string }{
+			{"↑/k, ↓/j", "Navigate up/down"},
+			{"Enter", "Select / Download"},
+			{"Esc", "Go back"},
+			{"q", "Back / Quit"},
+			{"s", "Cycle sort (search or downloaded panel)"},
+			{"d", "Delete model (downloaded panel)"},
+			{"r", "Run model with llama-server (downloaded panel)"},
+			{"k", "Kill running server"},
+			{"l", "View server logs"},
+			{"←/→", "Previous/Next page (in search)"},
+			{"Tab", "Switch focus: search ↔ downloaded / README ↔ Files"},
+			{"?", "Toggle this help"},
+			{"Ctrl+C", "Force quit"},
+		}
 
 	for _, item := range helpItems {
 		b.WriteString(fmt.Sprintf("  %s%-12s%s  %s\n", display.Cyan, item.key, display.Reset, item.desc))
@@ -931,12 +1029,16 @@ func (m tuiModel) viewInputScreen() string {
 			nameW = 15
 		}
 
+		cfg := config.Load()
+		dlDir := display.ExpandHome(cfg.DownloadsDir)
+
 		for i := m.localScroll; i < end; i++ {
 			r := rows[i]
 			mod := m.localModels[r.repoIdx]
 			cursor := "  "
 			style := lipgloss.NewStyle()
-			if i == m.localCursor && m.localFocus {
+			selected := i == m.localCursor && m.localFocus
+			if selected {
 				cursor = cursorStyle.Render("> ")
 				style = selStyle
 			}
@@ -945,9 +1047,14 @@ func (m tuiModel) viewInputScreen() string {
 				f := mod.Files[r.fileIdx]
 				relTime := display.RelativeTime(f.ModTime)
 				fname := display.Truncate(f.Name, nameW-2)
+				mp := filepath.Join(dlDir, mod.Repo, f.Name)
 				line := fmt.Sprintf("  %-*s  %-9s  %-12s", nameW-2, fname, display.FormatSize(f.Size), relTime)
 				b.WriteString(cursor)
-				b.WriteString(style.Render(line))
+				if m.isRunning(mp) && !selected {
+					b.WriteString(greenStyle.Render(line))
+				} else {
+					b.WriteString(style.Render(line))
+				}
 			} else {
 				relTime := display.RelativeTime(mod.ModTime)
 				expandIcon := "▸"
@@ -957,11 +1064,24 @@ func (m tuiModel) viewInputScreen() string {
 				name := display.Truncate(mod.Repo, nameW-3)
 				line := fmt.Sprintf("%s %-*s  %-9s  %2d files  %-12s",
 					expandIcon, nameW-3, name, display.FormatSize(mod.Size), len(mod.Files), relTime)
+				anyRunning := false
+				for _, f := range mod.Files {
+					mp := filepath.Join(dlDir, mod.Repo, f.Name)
+					if m.isRunning(mp) {
+						anyRunning = true
+						break
+					}
+				}
 				b.WriteString(cursor)
-				b.WriteString(style.Render(line))
+				if anyRunning && !selected {
+					b.WriteString(greenStyle.Render(line))
+				} else {
+					b.WriteString(style.Render(line))
+				}
 			}
 			b.WriteString("\n")
 		}
+
 	}
 
 	if m.deleteConfirm {
@@ -1381,7 +1501,7 @@ func waitForProgress(ch chan dlProgressMsg) tea.Cmd {
 
 func Run() error {
 	m := newTUIModel()
-	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
+	p := tea.NewProgram(m, tea.WithAltScreen())
 	_, err := p.Run()
 	return err
 }
