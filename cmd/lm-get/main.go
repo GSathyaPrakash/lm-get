@@ -12,7 +12,7 @@ import (
 	"github.com/loq/lm-get/internal/tui"
 )
 
-var version = "0.9.0"
+var version = "0.9.1"
 
 func main() {
 	api.Version = version

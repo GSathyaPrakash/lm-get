@@ -40,6 +40,8 @@ lm-get/
 │   │   └── display.go        # Terminal formatting: colors, sizes, progress bars, text utils
 │   ├── cli/
 │   │   └── cli.go            # CLI command handlers (search, info, download, list, remove, help)
+│   ├── server/
+│   │   └── state.go          # Persistent server state (PID, log path, alive checks)
 │   └── tui/
 │       └── tui.go            # Interactive Bubble Tea TUI application
 ├── go.mod / go.sum
@@ -67,7 +69,8 @@ internal/tui
 ├── internal/config
 ├── internal/display
 ├── internal/download
-└── internal/models
+├── internal/models
+└── internal/server
 
 internal/cli
 ├── internal/api
@@ -168,6 +171,15 @@ Full Bubble Tea application. Handles all TUI states, keybindings, rendering.
 - States: Input → Loading → Search → Loading → Detail → Downloading → MmprojPrompt
 - Also manages: local models panel, server process launching, log viewing
 
+### `internal/server` — Server State Persistence
+Tracks running llama-server processes across sessions via `~/.cache/lm-get/servers.json`.
+- `Load()` — Load state, prune dead PIDs
+- `Save()` — Write state to disk
+- `Set(modelPath, entry)` — Register a running server
+- `Remove(modelPath)` — Remove a server entry
+- `IsAlive(pid)` — Check if PID is still running (via `kill(pid, 0)`)
+- `LogDir()` — Returns `~/.cache/lm-get/logs/`
+
 ## Key APIs (Hugging Face)
 
 | Endpoint | Purpose |
@@ -184,3 +196,28 @@ Full Bubble Tea application. Handles all TUI states, keybindings, rendering.
 - Error handling: CLI uses `display.PrintError()`, TUI shows in `m.err`
 - Downloads go to `<downloads_dir>/<user>/<repo>/<file>.gguf`
 - Cache entries are keyed by URL hash, stored as JSON in `~/.cache/lm-get/`
+
+## Release Process
+
+### Version locations to update
+1. `cmd/lm-get/main.go` — `var version = "x.y.z"`
+2. `PKGBUILD` — `pkgver=x.y.z`
+
+### Push to GitHub
+```bash
+git add -A
+git commit -m "v0.x.y: <summary>"
+git tag v0.x.y
+git push origin main --tags
+```
+
+### Push to AUR
+AUR repo is at `~/git/lm-get-aur/` (cloned from `ssh://aur@aur.archlinux.org/lm-get.git`).
+```bash
+cd ~/git/lm-get-aur/
+# Update PKGBUILD pkgver=x.y.z
+# Update .SRCINFO pkgver and source URL to match
+git add PKGBUILD .SRCINFO
+git commit -m "Update to x.y.z"
+git push origin master
+```

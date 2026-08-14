@@ -87,7 +87,8 @@ func SearchModels(query string, limit int, sortBy string, direction string, page
 
 	u, _ := url.Parse("https://huggingface.co/api/models")
 	q := u.Query()
-	q.Set("search", query+" gguf")
+	q.Set("search", query)
+	q.Set("filter", "gguf")
 	q.Set("sort", sortBy)
 	q.Set("direction", direction)
 	q.Set("limit", fmt.Sprintf("%d", limit))
