@@ -68,7 +68,8 @@ Create defaults with `lm-get config init`:
   "results_per_page": 20,
   "default_sort": "downloads",
   "cache_ttl_seconds": 300,
-  "run_command": "llama-server --model {model} --port 8080"
+  "run_command": "llama-server --model {model} --port 8080",
+  "parallel_connections": 8
 }
 ```
 

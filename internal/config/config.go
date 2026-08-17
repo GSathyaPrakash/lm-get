@@ -10,20 +10,22 @@ import (
 )
 
 type Config struct {
-	DownloadsDir   string `json:"downloads_dir"`
-	ResultsPerPage int    `json:"results_per_page"`
-	DefaultSort    string `json:"default_sort"`
-	CacheTTL       int    `json:"cache_ttl_seconds"`
-	RunCommand     string `json:"run_command"`
+	DownloadsDir        string `json:"downloads_dir"`
+	ResultsPerPage      int    `json:"results_per_page"`
+	DefaultSort         string `json:"default_sort"`
+	CacheTTL            int    `json:"cache_ttl_seconds"`
+	RunCommand          string `json:"run_command"`
+	ParallelConnections int    `json:"parallel_connections"`
 }
 
 func Default() Config {
 	return Config{
-		DownloadsDir:   "~/Models",
-		ResultsPerPage: 20,
-		DefaultSort:    "downloads",
-		CacheTTL:       300,
-		RunCommand:     "llama-server --model {model} --port 8080",
+		DownloadsDir:        "~/Models",
+		ResultsPerPage:      20,
+		DefaultSort:         "downloads",
+		CacheTTL:            300,
+		RunCommand:          "llama-server --model {model} --port 8080",
+		ParallelConnections: 8,
 	}
 }
 
@@ -46,6 +48,15 @@ func (c Config) Validate() Config {
 	}
 	if c.RunCommand == "" {
 		c.RunCommand = "llama-server --model {model} --port 8080"
+	}
+	if c.ParallelConnections == 0 {
+		c.ParallelConnections = 8
+	}
+	if c.ParallelConnections < 1 {
+		c.ParallelConnections = 1
+	}
+	if c.ParallelConnections > 16 {
+		c.ParallelConnections = 16
 	}
 	return c
 }

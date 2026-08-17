@@ -235,7 +235,7 @@ func CmdDownload(args []string) {
 		return
 	}
 
-	if err := download.File(downloadURL, destPath); err != nil {
+	if err := download.FileWithRetries(downloadURL, destPath, 3); err != nil {
 		display.PrintError("Download failed: %v", err)
 		return
 	}

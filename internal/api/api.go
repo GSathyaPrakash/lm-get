@@ -25,9 +25,10 @@ var APIClient = &http.Client{Timeout: 30 * time.Second}
 var DLClient = &http.Client{
 	Timeout: 0,
 	Transport: &http.Transport{
-		MaxIdleConns:       10,
-		IdleConnTimeout:    90 * time.Second,
-		DisableCompression: true,
+		MaxIdleConns:        32,
+		MaxIdleConnsPerHost: 16,
+		IdleConnTimeout:     90 * time.Second,
+		DisableCompression:  true,
 	},
 }
 

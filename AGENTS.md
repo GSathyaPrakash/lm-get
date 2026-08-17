@@ -115,7 +115,7 @@ Reads/writes `~/.config/lm-get/config.json`. Validates all fields with sensible 
 - `Default()` — Return default config
 - `CmdConfigInit()` — CLI handler for `lm-get config init`
 
-Config fields: `downloads_dir`, `results_per_page`, `default_sort`, `cache_ttl_seconds`, `run_command`.
+Config fields: `downloads_dir`, `results_per_page`, `default_sort`, `cache_ttl_seconds`, `run_command`, `parallel_connections`.
 
 ### `internal/cache` — API Response Cache
 File-based cache at `~/.cache/lm-get/`. JSON entries with TTL from config.
@@ -138,8 +138,9 @@ HTTP client with retry (3 attempts, backoff). All HF API interaction.
 - `Version` — Set by main at startup (for User-Agent header)
 
 ### `internal/download` — File Download
-Downloads files with resume support, progress tracking, disk-space verification.
+Downloads files with parallel range requests (default 8 connections, `parallel_connections` in config), crash-safe resume via a `.lmget-state` sidecar tracking completed byte ranges, per-segment retries, progress tracking, disk-space verification.
 - `File(url, dest)` — Download with CLI progress bar
+- `FileWithRetries(url, dest, attempts)` — File with whole-engine retries
 - `MultipleFiles(repo, paths, outputDir)` — Download shard group
 - `ToFile(url, dest, progressChan)` — Download with channel-based progress (for TUI)
 
